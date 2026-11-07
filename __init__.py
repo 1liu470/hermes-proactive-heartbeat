@@ -39,7 +39,6 @@ from . import platforms as PF
 from . import prompts as P
 from . import research as RS
 from . import sense as SN
-from . import sources as SRC
 from . import store as S
 
 log = logging.getLogger("plugins.proactive_heartbeat")
@@ -86,12 +85,6 @@ DEFAULTS: Dict[str, Any] = {
     "model_timeout_seconds": 60,
     "max_message_tokens": 220,
     "intent_block_cooldown_minutes": 45,
-    # University OS bridge: read-only HTTP, off unless pointed at a live instance.
-    "university_enabled": False,
-    "university_url": "",
-    "university_cache_seconds": 300,
-    "university_timeout_seconds": 3,
-    "university_max_items": 14,
 }
 
 _RUNTIME: Dict[str, Any] = {"thread": None, "stop": None, "ctx": None, "lock": threading.RLock()}
@@ -403,50 +396,6 @@ def _ask_model(ctx, item: E.Item, comp: Dict[str, float], now: float,
     return _guard(result)
 
 
-def _external_items(ctx, state: Dict[str, Any], now: float, tz) -> List[E.Item]:
-    """Candidates from University OS, or nothing at all if it is not reachable."""
-    if not bool(_cfg(ctx, "university_enabled")):
-        return []
-    url = str(_cfg(ctx, "university_url") or "").strip()
-    if not url:
-        return []
-    ext = state.setdefault("external", {}).setdefault("uo", {"nudged": {}})
-    ext.setdefault("nudged", {})
-    data = SRC.fetch_state(
-        url,
-        timeout=float(_cfg(ctx, "university_timeout_seconds") or 3),
-        cache_seconds=float(_cfg(ctx, "university_cache_seconds") or 300),
-    )
-    if data is None:
-        if ext.get("last_error") != "unreachable":
-            ext["last_error"] = "unreachable"
-            S.log_decision({"ts": now, "event": "source_down", "source": "university", "url": url})
-        return []
-    ext["last_error"] = None
-    ext["last_ok_at"] = now
-    items = SRC.items_from_state(
-        data, now, tz, nudged=ext.get("nudged") or {},
-        max_items=int(_cfg(ctx, "university_max_items") or 14),
-    )
-    ext["last_candidate_count"] = len(items)
-    return items
-
-
-def _claim_external(state: Dict[str, Any], item: E.Item, now: float) -> None:
-    """Remember that an external item was already surfaced (never in the source)."""
-    if not item.id.startswith("uo:"):
-        return
-    ext = state.setdefault("external", {}).setdefault("uo", {"nudged": {}})
-    table = ext.setdefault("nudged", {})
-    prev = table.get(item.id) or {}
-    table[item.id] = {"at": now, "n": int(prev.get("n") or 0) + 1,
-                      "title": item.title, "created_at": prev.get("created_at") or now}
-    # Keep the ledger bounded: the plugin only ever needs recent surfaces.
-    if len(table) > 200:
-        keep = sorted(table.items(), key=lambda kv: float(kv[1].get("at") or 0))[-120:]
-        ext["nudged"] = dict(keep)
-
-
 def _allowed_platforms(ctx) -> list:
     raw = _cfg(ctx, "allowed_platforms")
     if isinstance(raw, str):
@@ -555,9 +504,8 @@ def _tick_body(ctx) -> None:
     state = S.load()
     _roll_day(state, now)
     rt = state["runtime"]
-    # Local intents stay authoritative for hand-noted things; University OS items
-    # are merged in read-only and never persisted into state["items"].
-    items = _items(state) + _external_items(ctx, state, now, tz)
+    # 手工记的事项是权威。若以后接外部源，只读合并，不写回 state["items"]。
+    items = _items(state)
 
     # 自感知层：没人交办的时候，从上下文推测一件他可能需要的事
     if bool(_cfg(ctx, "sense_enabled")):
@@ -572,9 +520,7 @@ def _tick_body(ctx) -> None:
 
     # 长期层：目标骨架每 6 小时同步一次，周体检每周注入一个候选
     if bool(_cfg(ctx, "longterm_enabled")):
-        lt = state.setdefault("longterm", {})
-        if now - float(lt.get("synced_at") or 0) > 6 * 3600:
-            LT.sync_goals(state, LT.fetch_goals(str(_cfg(ctx, "university_url") or "")), now)
+        state.setdefault("longterm", {})
         # 语义归因队列：每次 tick 只处理一条，timeout 压在 15 秒，
         # 它跑在心跳线程里，慢一点可以，但不能拖住后面的门控判断。
         queue = state.get("goal_attr_pending") or []
@@ -695,8 +641,7 @@ def _tick_body(ctx) -> None:
         if existing.id == item.id:
             items[idx] = item
             break
-    _mutate_items(state, [i for i in items if not i.id.startswith("uo:")])
-    _claim_external(state, item, now)
+    _mutate_items(state, items)
     # 消息里合并进去的其他条目也要标记，否则下一轮还会被当作新鲜候选再说一遍
     for n in decision.get("used") or []:
         candidates = decision.get("candidates") or []
@@ -704,7 +649,6 @@ def _tick_body(ctx) -> None:
             extra = candidates[n - 1]
             extra.nudges += 1
             extra.last_nudged_at = now
-            _claim_external(state, extra, now)
     rt["daily_count"] = int(rt.get("daily_count") or 0) + 1
     rt["last_injection_at"] = now
     rt["last_gate_reason"] = "sent"
@@ -1005,7 +949,6 @@ def _handle_status(**_: Any) -> str:
     state = S.load()
     rt = state["runtime"]
     items = [i for i in _items(state) if i.is_open()]
-    ext = (state.get("external") or {}).get("uo") or {}
     tz = _tz()
     tzname = getattr(tz, "key", None) or str(tz)
     local_now = datetime.fromtimestamp(now, tz).strftime("%Y-%m-%d %H:%M:%S")
@@ -1019,12 +962,6 @@ def _handle_status(**_: Any) -> str:
         "today_sent": rt.get("daily_count"),
         "last_injection_at": rt.get("last_injection_at"),
         "last_session_key": rt.get("last_session_key"),
-        "university": {
-            "reachable": ext.get("last_error") is None,
-            "candidates": ext.get("last_candidate_count"),
-            "last_ok_at": ext.get("last_ok_at"),
-            "surfaced": len(ext.get("nudged") or {}),
-        },
         "open_items": [{"id": i.id, "title": i.title,
                         "due": E.humanize_due(i.due, now) if i.due else None,
                         "nudges": i.nudges} for i in items],
@@ -1166,11 +1103,6 @@ def _handle_command(raw: str) -> str:
     if data["recent"]:
         last = data["recent"][-1]
         lines.append(f"最近一次决策：{last.get('event')} / {last.get('reason')}")
-    uni = data.get("university") or {}
-    if uni.get("reachable") is False:
-        lines.append("大学项目：连不上（跳过该源，不影响手工事项）")
-    else:
-        lines.append(f"大学项目：候选 {uni.get('candidates')} 条，已提醒过 {uni.get('surfaced')} 条")
     return "\n".join(lines)
 
 

@@ -1,16 +1,17 @@
 """长期层：把"接下来几小时做什么"接回"这半年往哪走"。
 
-为什么需要它：事件层（微信抽的事项、大学项目的 deadline）是短期的——
-做完就消失，下周账本又是空的。大学项目里其实有 24 个长期节点
-（1 北极星 + 8 域 + 15 目标），但它们全是 `status: todo`、`done` 为空，
-因为没有任何机制在推动或测量。
+为什么需要它：事件层（微信抽的事项、临期任务）是短期的——
+做完就消失，下周账本又是空的。要看出"哪条路在动、哪条路停了"，
+得先有一副长期骨架，再把零散事项挂上去。
 
-这一层只做三件事：
+这一层只做两件事：
 
-1. **同步目标**：从大学项目只读拉取 domain/goal，作为长期骨架；
-2. **归因**：把事件层的事项挂到目标上（关键词重叠，宁可漏不误挂）；
-3. **周体检**：每周问一次"哪个域这周动了、哪个域很久没动"，
+1. **归因**：把事件层的事项挂到目标上（关键词重叠，宁可漏不误挂）；
+2. **周体检**：每周问一次"哪个域这周动了、哪个域很久没动"，
    产出一句人话，交给同一套裁决决定说不说。
+
+目标从哪来：本层不再自带任何外部数据源。`state["goals"]` 为空时，
+归因与周体检自动空转，不报错、不打扰。要启用，把节点写进 goals 即可。
 
 不做的事：不改目标的 `done`（那是事实判断，只能由人填），
 不替用户设定新目标，不把"没动"解释成"你不够努力"——只陈述数字。
@@ -25,36 +26,6 @@ from . import engine as E
 
 #: 一个域超过这么多天没有任何推进信号，周体检里点出来
 STALL_DAYS = 14.0
-
-
-def fetch_goals(url: str, *, timeout: float = 3.0) -> List[Dict[str, Any]]:
-    """从 University OS 拉长期节点（domain + goal）。失败返回空列表。"""
-    import json
-    import urllib.request
-
-    try:
-        with urllib.request.urlopen(url.rstrip("/") + "/api/state", timeout=timeout) as r:
-            data = json.loads(r.read().decode("utf-8", "replace"))
-    except Exception:
-        return []
-    nodes = ((data.get("tree") or {}).get("nodes") or []) if isinstance(data, dict) else []
-    out = []
-    for n in nodes:
-        if not isinstance(n, dict):
-            continue
-        lvl = str(n.get("level") or "")
-        if lvl not in ("north", "domain", "goal"):
-            continue
-        out.append({
-            "id": str(n.get("id") or ""),
-            "level": lvl,
-            "domain": str(n.get("domain") or ""),
-            "title": str(n.get("title") or "")[:80],
-            "due": n.get("due"),
-            "parent": n.get("parent"),
-            "weight": float(n.get("weight") or (1.0 if lvl == "north" else 0.6)),
-        })
-    return out
 
 
 def sync_goals(state: Dict[str, Any], goals: List[Dict[str, Any]], now: float) -> int:

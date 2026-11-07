@@ -1,5 +1,5 @@
 name: proactive-heartbeat
-version: "1.1.0"
+version: "1.2.0"
 description: "主动提醒回路：确定性信号采集 → 显著性门控 → 单次廉价模型裁决 → 注入一轮对话 → 按反馈自调门槛。来源已核：ProactiveAgent 的事件桶心跳与反馈规则、Generative Agents 的显著性打分与注意力预算、Muse 的打断门槛与可调档位。任何异常一律不发言。"
 author: "Hermes (synthesis of thunlp/ProactiveAgent, joonspk-research/generative_agents, Meta Muse design notes)"
 license: "MIT"
@@ -114,23 +114,3 @@ config_schema:
     type: int
     default: 45
     description: "未结事项清单注入到上下文的冷却时间"
-  university_enabled:
-    type: bool
-    default: true
-    description: "读取大学项目（University OS）的只读信号"
-  university_url:
-    type: str
-    default: "http://127.0.0.1:<port>"
-    description: "University OS 服务地址"
-  university_cache_seconds:
-    type: int
-    default: 300
-    description: "快照缓存秒数"
-  university_timeout_seconds:
-    type: int
-    default: 3
-    description: "取快照的超时"
-  university_max_items:
-    type: int
-    default: 14
-    description: "单次最多转换多少条候选"
