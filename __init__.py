@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Optional
 
 from . import engine as E
 from . import longterm as LT
+from . import platforms as PF
 from . import prompts as P
 from . import research as RS
 from . import sense as SN
@@ -443,11 +444,6 @@ def _claim_external(state: Dict[str, Any], item: E.Item, now: float) -> None:
         ext["nudged"] = dict(keep)
 
 
-#: 私聊标记：session_key 里出现这些才算"一对一的对话"。
-#: Hermes 的 key 形如 agent:main:qqbot:dm:<chat_id>；群聊会带 group/room/channel。
-_DIRECT_MARKS = (":dm:", ":private:", ":p2p:", ":direct:")
-
-
 def _allowed_platforms(ctx) -> list:
     raw = _cfg(ctx, "allowed_platforms")
     if isinstance(raw, str):
@@ -455,22 +451,41 @@ def _allowed_platforms(ctx) -> list:
     return [str(x).strip().lower() for x in (raw or []) if str(x).strip()]
 
 
+def _want_platforms(mode: str) -> list:
+    """delivery_mode 想发到哪些平台。
+
+        platform:qqbot              单平台（旧写法，保留）
+        platforms:qqbot,telegram    多平台
+        active                      白名单内、已经建立过会话的平台
+        all                         已删除——它的语义是广播
+
+    认不出的写法返回空，由调用方决定是走白名单回退还是不发。
+    """
+    m = str(mode or "").strip().lower()
+    if m.startswith("platforms:"):
+        tail = m.split(":", 1)[1].replace("，", ",")
+        return [x.strip() for x in tail.split(",") if x.strip()]
+    if m.startswith("platform:"):
+        one = m.split(":", 1)[1].strip()
+        return [one] if one else []
+    return []
+
+
 def _deliver(ctx, state: Dict[str, Any], content: str, now: float) -> tuple:
     """把消息投到哪里，返回 (是否至少成功一次, 用到的平台)。
 
-    两道硬闸，发送前逐条判定，不依赖 delivery_mode 的写法：
+    平台判定交给 `platforms.py`：它按网关键的 `chat_type` 段结构化解析，
+    不靠猜子串。三道闸：
 
-      1. 平台必须在 allowed_platforms 里（默认只有 qqbot）
-      2. require_direct 为真时 session_key 必须是私聊（含 :dm: 一类标记）
+      1. 平台必须在 allowed_platforms 里；空名单 fail closed
+      2. 键里的平台与配置的平台必须一致（伪造键不算数）
+      3. require_direct 为真时必须是 direct——`unknown` 也拒
 
-    而且**回退路径同样过闸**：找不到指定平台就静默不发，绝不"退而求其次"
-    发到最近会话——那个回退正是消息跑到别的对话里的原因。
-
-    allowed_platforms 为空时一律拒发（fail closed），不做"留空即不限制"的解释：
-    这条闸的用途就是限制，留空只能是限制到零。
+    回退路径只从**白名单内**的会话里挑，且同样过这三道闸。旧版回退到
+    `last_session_key`，那是消息跑到桌面上的原因。
     """
     rt = state.get("runtime") or {}
-    mode = str(_cfg(ctx, "delivery_mode") or "active").lower()
+    mode = str(_cfg(ctx, "delivery_mode") or "").lower()
     sessions = rt.get("sessions") or {}
     allowed = _allowed_platforms(ctx)
     require_direct = bool(_cfg(ctx, "require_direct"))
@@ -479,34 +494,37 @@ def _deliver(ctx, state: Dict[str, Any], content: str, now: float) -> tuple:
         log.warning("proactive: allowed_platforms 为空，拒绝一切投递")
         return False, ""
 
-    targets = []
     if mode == "all":
-        targets = [(p, v.get("key")) for p, v in sessions.items() if v.get("key")]
-    elif mode.startswith("platform:"):
-        want = mode.split(":", 1)[1].strip().lower()
-        entry = sessions.get(want) or {}
-        if entry.get("key"):
-            targets = [(want, entry["key"])]
+        log.warning("proactive: delivery_mode=all 会广播到每个会话，已删除该语义；本次不发")
+        return False, ""
+
+    wants = _want_platforms(mode)
+    if mode == "active":
+        wants = [p for p in allowed if (sessions.get(p) or {}).get("key")]
+
+    targets = [(p, (sessions.get(p) or {}).get("key")) for p in wants]
+    targets = [(p, k) for p, k in targets if k]
+
     if not targets:
-        key = str(rt.get("last_session_key") or "")
-        if key:
-            targets = [(str(rt.get("last_platform") or "?"), key)]
+        cand = [(p, v.get("key"), float(v.get("at") or 0))
+                for p, v in sessions.items()
+                if v.get("key") and str(p).lower() in allowed]
+        if cand:
+            cand.sort(key=lambda x: x[2], reverse=True)
+            targets = [(cand[0][0], cand[0][1])]
 
     ok_any, used, blocked = False, [], []
     for platform, key in targets:
-        plat = str(platform or "").lower()
-        if plat not in allowed:
-            blocked.append(f"{plat}:platform")
-            continue
-        if require_direct and not any(m in str(key).lower() for m in _DIRECT_MARKS):
-            blocked.append(f"{plat}:not_direct")
+        ok, why = PF.is_allowed_target(key, platform, allowed, require_direct)
+        if not ok:
+            blocked.append(f"{platform}:{why}")
             continue
         try:
             if ctx.inject_message(content, role="user", session_key=key):
                 ok_any = True
-                used.append(plat)
+                used.append(str(platform).lower())
         except Exception as exc:
-            log.debug("proactive: inject to %s failed: %s", plat, exc)
+            log.debug("proactive: inject to %s failed: %s", platform, exc)
     if blocked:
         log.debug("proactive: 投递被闸门拦下 %s", blocked)
     return ok_any, ",".join(used)
@@ -1006,9 +1024,13 @@ def _handle_status(**_: Any) -> str:
                         "nudges": i.nudges} for i in items],
         "delivery": {
             "mode": mode,
+            "wanted": _want_platforms(mode),
             "allowed_platforms": allowed,
             "require_direct": require_direct,
-            "known_sessions": sorted((rt.get("sessions") or {}).keys()),
+            "sessions": {
+                p: {"kind": PF.describe(v.get("key")), "at": v.get("at")}
+                for p, v in (rt.get("sessions") or {}).items()
+            },
             "last_platform": rt.get("last_platform"),
         },
         "stats": state.get("stats"),
@@ -1130,9 +1152,9 @@ def _handle_command(raw: str) -> str:
         lines.insert(2, "类型响应：" + "、".join(_parts))
     _d = data.get("delivery") or {}
     _allow = "、".join(_d.get("allowed_platforms") or []) or "（空，一律不发）"
+    _sess = "、".join(f"{p}={v.get('kind')}" for p, v in (_d.get("sessions") or {}).items()) or "无"
     lines.insert(2, f"投递 {_d.get('mode')}｜允许 {_allow}｜"
-                    f"{'仅私聊' if _d.get('require_direct') else '含群聊'}｜"
-                    f"已知会话 {'、'.join(_d.get('known_sessions') or []) or '无'}")
+                    f"{'仅私聊' if _d.get('require_direct') else '含群聊'}｜会话 {_sess}")
     for it in data["open_items"][:6]:
         lines.append(f"  · {it['title']}（{it['due'] or '无期限'}，已提醒 {it['nudges']} 次）")
     if data["recent"]:

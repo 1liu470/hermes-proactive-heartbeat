@@ -80,7 +80,9 @@ decayed = base × (0.40 + 0.60·连续性)          # 连续性 = 0.97^天数
 | `cooldown_minutes` | 40 | 两条主动消息的最小间隔（紧急事项压到 1/3） |
 | `daily_budget` | 8 | 每日上限（再被档位上限压一次） |
 | `threshold` | 0.62 | 显著性门槛 |
-| `delivery_mode` | all | active（最近会话）/ all（所有活跃平台）/ platform:qqbot |
+| `delivery_mode` | platform:qqbot | platform:<名字> 单平台 / platforms:<a,b> 多平台 / active 白名单内已有会话的平台（all 已废弃） |
+| `allowed_platforms` | `["qqbot"]` | 平台白名单；留空则一律不发 |
+| `require_direct` | true | 只投私聊；判不出私聊的会话（桌面）也拒 |
 | `research_enabled` | true | 期限窗口内先联网查资料 |
 | `research_window_hours` | 72 | 多远内的期限才触发研究 |
 | `research_daily_cap` | 6 | 每天最多研究几次 |
@@ -722,39 +724,77 @@ if not targets:                       # 找不到指定平台
 这一段是最隐蔽的：就算把 `delivery_mode` 配成 `platform:qqbot`，只要那一刻 QQ 会话还没记录，
 它就会退而求其次发给桌面——**配置写着 QQ，东西却跑到了桌面**。
 
-### 改成两道硬闸，回退路径同样过闸
+### 改成结构化判定，回退路径同样过闸
+
+原先是猜字符串（找 `:dm:` 子串）。猜错的方向是"把群聊当私聊"，代价远大于沉默，
+所以改成按结构解。Hermes 的会话键是
+
+```
+agent:<profile>:<platform>:<chat_type>:<chat_id>
+```
+
+`chat_type` 由各平台适配器给出，是协议层事实，不用猜：
+
+| 判定 | `chat_type` 取值 | `require_direct=true` 时 |
+|---|---|---|
+| 私聊 | `dm` / `private` / `p2p` / `direct` / `im` | 放行 |
+| 群类 | `group` / `channel` / `thread` / `forum` / `room` / `guild` / `supergroup` | 拒 |
+| 判不出 | 没有平台前缀的本地会话号 | 拒 |
+
+判不出的一律按不安全处理。桌面恰好是这一类——它的键 `20260101_000000_abcdef` 没有平台段，
+所以**就算把 `desktop` 加进白名单也发不出去**。这一条是有意为之：宁可沉默，也不赌。
+
+三道闸：
 
 | 闸 | 默认 | 行为 |
 |---|---|---|
 | `allowed_platforms` | `["qqbot"]` | 平台不在名单内一律不发；**名单为空则全拒**（fail closed，不做"留空即不限制"的解释） |
-| `require_direct` | `true` | `session_key` 必须带 `:dm:` / `:private:` / `:p2p:` 一类标记，群聊（`:group:`）一律不发 |
+| `require_direct` | `true` | 见上表 |
+| `delivery_mode` | `platform:qqbot` | 多平台写 `platforms:qqbot,telegram` |
 
-回退目标也要过这两道闸。所以"找不到 QQ 就发桌面"这条路被彻底堵死——**宁可不发**。
+`all` 已删除。它的语义是"所有活跃过的平台各发一次"，也就是广播，与"不许插到别处"直接冲突。
+留着它等于留一个随时会踩的开关——现在配了 `all` 也不发。
+
+回退也换了：只在 `allowed_platforms` 内、已经建过会话的平台里挑最近的那个。
+`last_session_key` 不再是回退源，因为那个字段可能就是桌面。
+
+### 多平台：一条发不出去不影响另一条
+
+```
+sessions = {qqbot: ...:dm:xxx, telegram: ...:dm:yyy}
+platforms:qqbot,telegram  → 发 2 条
+
+sessions = {qqbot: ...:dm:xxx, telegram: ...:group:-100...}
+platforms:qqbot,telegram  → 发 1 条（telegram 那条是群，被拦）
+```
+
+每个平台各自解键、各自过闸，互不牵连。
 
 ### 实测
 
 真实 state（同时存在 desktop 与 qqbot 两个会话）：
 
 ```
-state 里的会话: {'desktop': '20261105_131001_24872e', 'qqbot': 'agent:main:qqbot:dm:0D88...'}
+state 里的会话: {'desktop': '20260101_000000_abcdef', 'qqbot': 'agent:main:qqbot:dm:0D88...'}
 投递结果: True | 平台: 'qqbot'
-实际会话: ['agent:main:qqbot:dm:0D888441B0B68A310D1B1DF72AADED2D']
+实际会话: ['agent:main:qqbot:dm:<qq_id>']
 ```
 
 desktop 在列表里，但一条都没发过去。
 
-九条测试覆盖了这些边界：
+三十四条测试覆盖这些边界（`test_delivery.py` 17 条 + `test_platforms.py` 17 条）：
 
 ```
-all 模式下桌面被拦 / 空白名单全拒 / 字符串名单可解析
-找不到 QQ 时不回退桌面 / 回退目标过闸后才发
-群会话被拦 / 私聊放行 / 显式关掉 require_direct 才允许群发
-默认配置（不传 settings）下桌面发不出去
+all 模式拒发 / 空白名单全拒 / 写错的 mode 不放大权限
+单平台 / 多平台各发一条 / 多平台受白名单约束 / 字符串名单可解析 / active 模式
+找不到指定平台时不回退桌面 / last_session_key 不作回退源 / 回退目标同样过闸
+QQ 群被拦 / 私聊放行 / telegram 群被拦 / desktop 加白名单也拦 / 显式关掉才允许群发
+键解析 / 五类私聊 / 四类群 / 无平台前缀判 unknown / 旧格式标记兜底
 ```
 
 ### 副作用
 
-QQ 会话没建立之前（比如刚装完还没在 QQ 里说过话），插件**一句都不会发**。
+QQ 会话没建立之前（刚装完还没在 QQ 里说过话），插件**一句都不会发**。
 这不是 bug，是这条闸的必然代价：不知道往哪发，就不发。
 
 ---

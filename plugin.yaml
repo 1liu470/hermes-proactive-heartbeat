@@ -73,15 +73,15 @@ config_schema:
   delivery_mode:
     type: string
     default: "platform:qqbot"
-    description: "投递路由：active / all / platform:<名字>"
+    description: "投递路由：platform:<名字> 单平台 / platforms:<a,b> 多平台 / active 白名单内已建会话的平台。all 已废弃（它会广播），配了也不发"
   allowed_platforms:
     type: list
     default: ["qqbot"]
-    description: "只允许投递到这些平台；留空则一律不发"
+    description: "只允许投递到这些平台；留空则一律不发。多平台写 [\"qqbot\",\"telegram\"]"
   require_direct:
     type: bool
     default: true
-    description: "只投私聊会话，不往群里发"
+    description: "只投私聊会话。会话键里判不出私聊的（如桌面纯会话号）也拒"
   research_enabled:
     type: bool
     default: true
