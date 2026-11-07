@@ -159,9 +159,9 @@ after_ts = mod.S.load()["runtime"]["last_user_turn_at"]
 print("idle clock untouched by own injection:", before_ts == after_ts)
 
 # --- 7. slash command surface --------------------------------------------
-print("--- /proactive status ---")
+print("--- /nudge status ---")
 print(mod._handle_command("status"))
-print("--- /proactive off ---")
+print("--- /nudge off ---")
 print(mod._handle_command("off"))
 mod._tick(ctx)
 print("tick while off injected delta:", len(ctx.injected) - before - 0, "(no new line expected above)")

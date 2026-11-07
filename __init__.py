@@ -1200,7 +1200,10 @@ def register(ctx) -> None:
     ctx.register_tool(name="proactive_status", toolset="proactive", schema=STATUS_SCHEMA,
                       handler=_handle_status, emoji="📋",
                       description=STATUS_SCHEMA["description"])
-    ctx.register_command("proactive", _handle_command,
+    # 命令名不能叫 proactive —— Hermes 内置的 /loop 已经把 proactive 用作别名，
+    # 冲突时宿主直接跳过注册，只在日志里留一行 WARNING。于是这个命令从来没生效过，
+    # 而且不会报错，只在你想用的时候发现它不存在。
+    ctx.register_command("nudge", _handle_command,
                          description="主动提醒：档位、事项、强制测试", args_hint="status|off|quiet|normal|eager|test")
     ctx.on_unload(_shutdown)
     _ensure_thread(ctx)

@@ -14,7 +14,7 @@ Muse（Meta 的个人智能体）是闭源云产品，主动推理跑在服务�
 |---|---|---|
 | **ProactiveAgent**（thunlp/ProactiveAgent） | 心跳跑在**便宜的事件流**上（`ActionListener`，15 秒桶，ActivityWatch 窗口/应用/AFK + 文件创建事件），模型只在桶里有信号时才被问；输出固定 JSON，`Proactive_Task: null` 表示不必帮忙；上一条的 `user_feedback` 会喂回下一条，规则是「用户忽略就别再打扰，用户拒绝就换个方式」 | `_heartbeat()` 的定时器 + `engine.gate()` 的确定性前置门 + `prompts.VERDICT_TEMPLATE` 的 `send:false` 默认 + `next_adaptive_offset()` 的反馈调参 |
 | **Generative Agents**（joonspk-research/generative_agents） | 记忆检索是加权和：`recency_w*recency + relevance_w*relevance + importance_w*importance`，三者权重均为 1，`recency_decay = 0.99` 按序位几何衰减；注意力有带宽（`att_bandwidth=3`、`retention=5`）；反思由**重要性累积**触发（`importance_trigger_max=150`） | `engine.score_item()` 的四项加权（紧迫/重要/新鲜/相关）+ `continuity()` 的 0.97 日衰减 + `interruption_cost()` 的注意力预算 + 门槛而非固定节奏 |
-| **Muse**（Meta 官方设计文 `introducing.muse.ai`、`about.fb.com` | 产品级判据：主动消息必须「genuinely helpful and worth the interruption」；档位可调（关/调低/调高）；决策要可审计；目标是长跑对象，不是一次性请求 | 默认沉默的裁决提示 + `/proactive off\|quiet\|normal\|eager` + `decisions.jsonl` 全量决策日志 + `proactive_intent` 把「目标/期限」做成一等公民 |
+| **Muse**（Meta 官方设计文 `introducing.muse.ai`、`about.fb.com` | 产品级判据：主动消息必须「genuinely helpful and worth the interruption」；档位可调（关/调低/调高）；决策要可审计；目标是长跑对象，不是一次性请求 | 默认沉默的裁决提示 + `/nudge off\|quiet\|normal\|eager` + `decisions.jsonl` 全量决策日志 + `proactive_intent` 把「目标/期限」做成一等公民 |
 
 三份之外加的一条，是它们都没有显式化的东西：**打扰成本项**。用户正在说话、今天已经说够了、连续两次被忽略——这些不进入分数，模型再聪明也会在错误的时间开口。
 
@@ -56,12 +56,16 @@ decayed = base × (0.40 + 0.60·连续性)          # 连续性 = 0.97^天数
 ## 三、用法
 
 ```
-/proactive                  # 状态：档位、今日已发、未结事项、最近决策
-/proactive off|quiet|normal|eager
-/proactive add 交实验报告 3d    # 不写时间就是 open_loop
-/proactive done <id>        # 或 drop / snooze <id> 2h
-/proactive test             # 强制跑一次（跳过冷却与空闲门），立刻听效果
+/nudge                      # 状态：档位、今日已发、未结事项、最近决策
+/nudge off|quiet|normal|eager
+/nudge add 交实验报告 3d    # 不写时间就是 open_loop
+/nudge done <id>            # 或 drop / snooze <id> 2h
+/nudge test                 # 强制跑一次（跳过冷却与空闲门），立刻听效果
 ```
+
+命令名是 `/nudge` 而不是 `/proactive`：Hermes 内置的 `/loop` 已经占用了 `proactive`
+作别名，插件再注册同名命令会被宿主静默跳过——日志里只有一行 WARNING，用的时候才发现
+命令不存在。
 
 智能体侧有两个工具：`proactive_intent`（add/list/done/drop/snooze）、`proactive_status`。
 对话里直接说「记一下下周三要交实验报告」即可，它会自己调 `proactive_intent`。
