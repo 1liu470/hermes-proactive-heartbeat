@@ -1,0 +1,136 @@
+name: proactive-heartbeat
+version: "1.1.0"
+description: "主动提醒回路：确定性信号采集 → 显著性门控 → 单次廉价模型裁决 → 注入一轮对话 → 按反馈自调门槛。来源已核：ProactiveAgent 的事件桶心跳与反馈规则、Generative Agents 的显著性打分与注意力预算、Muse 的打断门槛与可调档位。任何异常一律不发言。"
+author: "Hermes (synthesis of thunlp/ProactiveAgent, joonspk-research/generative_agents, Meta Muse design notes)"
+license: "MIT"
+provides_hooks:
+  - pre_llm_call
+  - on_session_end
+provides_tools:
+  - proactive_intent
+  - proactive_status
+config_schema:
+  enabled:
+    type: bool
+    default: true
+    description: "总开关"
+  dial:
+    type: str
+    default: "normal"
+    description: "off | quiet | normal | eager"
+  tick_seconds:
+    type: int
+    default: 120
+    description: "心跳间隔（秒），最小 15"
+  quiet_hours:
+    type: list
+    default: ["23:00", "08:00"]
+    description: "免打扰区间，支持跨午夜"
+  min_idle_minutes:
+    type: int
+    default: 15
+    description: "用户停止说话多久后才允许主动开口"
+  cooldown_minutes:
+    type: int
+    default: 40
+    description: "两次主动消息之间的最小间隔"
+  daily_budget:
+    type: int
+    default: 8
+    description: "每日最多主动条数"
+  threshold:
+    type: float
+    default: 0.62
+    description: "显著性门槛（0..1），会被档位覆盖"
+  model_timeout_seconds:
+    type: int
+    default: 60
+    description: "裁决模型的超时"
+  max_message_tokens:
+    type: int
+    default: 220
+    description: "裁决模型返回上限"
+  urgent_window_hours:
+    type: int
+    default: 6
+    description: "紧急通道的期限窗口（小时）"
+  urgent_min_idle_seconds:
+    type: int
+    default: 180
+    description: "紧急通道要求的最短静默秒数"
+  sense_enabled:
+    type: bool
+    default: true
+    description: "没人交办时，从上下文推测他需要什么"
+  sense_daily_cap:
+    type: int
+    default: 2
+    description: "每天最多推测几次"
+  sense_repeat_days:
+    type: int
+    default: 7
+    description: "同一假设多少天内不重复"
+  delivery_mode:
+    type: string
+    default: "platform:qqbot"
+    description: "投递路由：active / all / platform:<名字>"
+  allowed_platforms:
+    type: list
+    default: ["qqbot"]
+    description: "只允许投递到这些平台；留空则一律不发"
+  require_direct:
+    type: bool
+    default: true
+    description: "只投私聊会话，不往群里发"
+  research_enabled:
+    type: bool
+    default: true
+    description: "进入期限窗口时先联网查一次资料再开口"
+  research_window_hours:
+    type: int
+    default: 72
+    description: "多少小时内的期限才触发研究"
+  research_max_items:
+    type: int
+    default: 3
+    description: "注入裁决提示的情报条数上限"
+  research_daily_cap:
+    type: int
+    default: 6
+    description: "每天最多研究几次"
+  longterm_enabled:
+    type: bool
+    default: true
+    description: "目标层：同步长期目标并做每周体检"
+  review_weekday:
+    type: int
+    default: 6
+    description: "周体检在周几（0=周一，6=周日）"
+  review_hour:
+    type: int
+    default: 20
+    description: "周体检在几点之后"
+  intent_block_cooldown_minutes:
+    type: int
+    default: 45
+    description: "未结事项清单注入到上下文的冷却时间"
+  university_enabled:
+    type: bool
+    default: true
+    description: "读取大学项目（University OS）的只读信号"
+  university_url:
+    type: str
+    default: "http://127.0.0.1:<port>"
+    description: "University OS 服务地址"
+  university_cache_seconds:
+    type: int
+    default: 300
+    description: "快照缓存秒数"
+  university_timeout_seconds:
+    type: int
+    default: 3
+    description: "取快照的超时"
+  university_max_items:
+    type: int
+    default: 14
+    description: "单次最多转换多少条候选"
