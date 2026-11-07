@@ -28,6 +28,14 @@ sys.path.insert(0, str(PLUGIN_DIR))
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
+# Freeze the clock at 14:00 today. The gate refuses to speak 23:00–08:00, which
+# is correct behaviour and would make this script fail every night after 11pm —
+# a red light that means "you ran it late", not "the plugin is broken".
+_real_time = time.time
+_midday = time.localtime(_real_time())
+_frozen = time.mktime((_midday.tm_year, _midday.tm_mon, _midday.tm_mday, 14, 0, 0, 0, 0, -1))
+time.time = lambda: _frozen
+
 # Isolate state so a simulation never touches the live intent ledger.
 SANDBOX = Path(tempfile.mkdtemp(prefix="ph-sim-"))
 os.environ["HERMES_HOME"] = str(SANDBOX)
@@ -110,8 +118,11 @@ item_id = json.loads(out)["id"]
 # --- 2. prime the runtime as if a session had been idle for an hour --------
 st = mod.S.load()
 st["runtime"].update({
-    "last_session_key": "ses_sim_1",
-    "last_platform": "desktop",
+    "last_session_key": "agent:main:qqbot:dm:sim0001",
+    "last_platform": "qqbot",
+    # 主动消息只进私聊；桌面的纯会话号判不出 chat_type，会被闸门拒掉，
+    # 所以这里造一个 QQ 私聊会话，模拟"人在 QQ 里说过话"。
+    "sessions": {"qqbot": {"key": "agent:main:qqbot:dm:sim0001", "at": time.time()}},
     "last_user_turn_at": time.time() - 3600,
     "context_terms": ["实验报告", "稳态"],
 })
