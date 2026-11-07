@@ -65,6 +65,18 @@ STOPWORDS = frozenset("""
 ACK_WORDS = ("收到", "好的", "嗯", "知道了", "明白", "行了", "ok", "okay",
              "了解", "记下", "已办", "搞定", "完成了", "谢谢")
 
+#: 应答开头的肯定词。
+#: 单字「好」「行」进不了 ACK_WORDS —— 那是子串匹配，"好像""行业"都会被算成回应。
+#: 可它们在句首作应答极常见："好，我这就去写" 既不在词表里，又与标题没有共同词，
+#: 于是被判成"这条提醒没落到他心里"，白白抬高一档门槛。人明明接住了，账上却记他无视。
+#: 锚定句首，误判面就窄得多。
+_ACK_HEAD = re.compile(
+    r"^(?:"
+    r"(?:好|行|嗯|对|是|中|成)(?=[，,、。.！!？?\s吧]|$)"   # 单字应答，须后接标点或收尾
+    r"|可以|没问题|马上|这就|我这就|去办|去写|去做"
+    r")"
+)
+
 #: 校园场景的常见简称，jieba 词表里没有，会被切成"大"+"创"。
 #: 可以在插件配置 user_words 里追加自己的（比赛名、课程名、项目简称）。
 USER_WORDS = (
@@ -241,8 +253,13 @@ def urgency(item: Item, now: float) -> float:
         # ago deserves a word; one missed last week is a backlog item, and nagging
         # about a "prepare for the meeting" task after the meeting happened is pure
         # noise.  Geometric decay with a floor keeps it in the pool without shouting.
+        #
+        # 但衰减只该用在**已经开过口**的事项上。从没催过的逾期事项若也一路衰减，
+        # 它会在账本里静静沉底、永远低于门槛——用户根本没被提醒过，就被系统判了沉默。
+        # 忘了的事恰恰最需要提醒；催过一次之后才轮到"别唠叨"这条规则接管。
         days_late = (-hours) / 24.0
-        return max(0.20, 0.88 ** days_late)
+        floor = 0.20 if (item.nudges or 0) > 0 else 0.75
+        return max(floor, 0.88 ** days_late)
     if hours <= 24:
         return 0.90 - 0.20 * (hours / 24.0)
     if hours <= 72:
@@ -528,7 +545,7 @@ def classify_feedback(pending: Optional[Dict[str, Any]], now: float,
         text = (user_text or "").strip()
         title = str(pending.get("title") or "")
         # 纯确认词（收到/好的/嗯）本身就是对提醒的回应，直接算 engaged
-        if any(a in text for a in ACK_WORDS):
+        if any(a in text for a in ACK_WORDS) or _ACK_HEAD.match(text):
             return "engaged"
         title_terms = terms(title)
         reply_terms = terms(text)

@@ -70,10 +70,22 @@ class TestSalience(unittest.TestCase):
         self.assertLess(near, close)
         self.assertGreater(overdue, 0.95, "just-missed stays near the top")
         self.assertLessEqual(overdue, 1.0)
-        stale = urgency(_item(due=NOW - 14 * 86400), NOW)
-        self.assertLess(stale, 0.30, "two weeks late is a backlog item, not an emergency")
-        self.assertGreaterEqual(stale, 0.20, "but it never leaves the pool entirely")
+        stale_nudged = urgency(_item(due=NOW - 14 * 86400, nudges=1), NOW)
+        self.assertLess(stale_nudged, 0.30, "已经催过的逾期事项是欠账，不是急事")
+        self.assertGreaterEqual(stale_nudged, 0.20, "但也别彻底沉底")
         self.assertGreater(far, 0.0)
+
+    def test_never_nudged_overdue_is_still_speakable(self):
+        # 一件从没被提过的逾期事项，若也按"欠账"衰减，就永远低于门槛：
+        # 用户根本没被提醒过，系统却已判它沉默。忘了的事最该提醒，所以它有保底。
+        it = _item(due=NOW - 20 * 86400)
+        self.assertGreaterEqual(urgency(it, NOW), 0.75)
+        comp = score_item(it, NOW, set())
+        self.assertGreaterEqual(comp["total"], 0.62, "保底要真的能过线，否则等于没有")
+
+    def test_overdue_decay_resumes_once_nudged(self):
+        it = _item(due=NOW - 20 * 86400, nudges=1)
+        self.assertLess(score_item(it, NOW, set())["total"], 0.62)
 
     def test_open_loop_never_saturates(self):
         u = urgency(Item(id="x", title="读文献", kind="open_loop", created_at=NOW - 10 * 86400), NOW)
@@ -200,6 +212,18 @@ class TestFeedback(unittest.TestCase):
         # 边界：正好 12 小时仍算窗口内
         edge = {"at": NOW - 12 * 3600 + 60, "title": "确认集合"}
         self.assertNotEqual(classify_feedback(edge, NOW, True, "好的"), "expired")
+
+    def test_bare_acknowledgement_counts_as_engaged(self):
+        """「好，我这就去写」——词表里只有「好的」，「好」不在，真机上被记成无视。"""
+        pending = {"at": NOW - 60, "title": "提交生物工程实验报告"}
+        for reply in ("好，我这就去写", "好", "行，知道了", "嗯嗯", "可以", "没问题，马上办"):
+            self.assertEqual(classify_feedback(pending, NOW, True, reply), "engaged", reply)
+
+    def test_single_char_prefix_does_not_swallow_real_words(self):
+        """「好像」「行业」「对方」不是应答。锚定句首还不够，得要求后接标点或收尾。"""
+        pending = {"at": NOW - 60, "title": "提交生物工程实验报告"}
+        for reply in ("好像不太对，我说的不是这个", "行业会议今年很冷清", "对方还没回复我"):
+            self.assertEqual(classify_feedback(pending, NOW, True, reply), "ignored", reply)
 
     def test_offset_moves_both_ways_with_caps(self):
         self.assertEqual(next_adaptive_offset(0.0, "ignored"), 0.04)
