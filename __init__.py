@@ -802,6 +802,12 @@ def _on_pre_llm_call(**kw: Any) -> Optional[Dict[str, str]]:
                 S.log_decision({"ts": now, "event": "feedback", "reason": "expired",
                                 "outcome": "expired", "item_id": pending.get("item_id"),
                                 "age_hours": round((now - float(pending.get("at") or now)) / 3600.0, 1)})
+            elif outcome == "ignored" and (pending or {}).get("ignored_once"):
+                # 同一条提醒在应答窗口里会被反复扫描——每轮对话都要问一次"他回了吗"。
+                # 原先每问一次就记一笔无视：真机账本上一条事项在 55 分钟里刷出五条
+                # ignored，ignore_streak 涨到 5，门槛被自己吓高，而用户可能只是还没
+                # 到桌前。记账必须幂等：第一笔算数，后面的轮次只是在等。
+                pass
             elif outcome:
                 state["adaptive_offset"] = E.next_adaptive_offset(
                     float(state.get("adaptive_offset") or 0.0), outcome)
@@ -812,13 +818,17 @@ def _on_pre_llm_call(**kw: Any) -> Optional[Dict[str, str]]:
                     ts["engaged"] = int(ts.get("engaged") or 0) + 1
                 if outcome == "ignored":
                     state["ignore_streak"] = int(state.get("ignore_streak") or 0) + 1
+                    # 不清 pending：窗口没关，他仍可能回。标记已记账，免得下轮再加一笔。
+                    if isinstance(pending, dict):
+                        pending["ignored_once"] = True
+                        rt["pending"] = pending
                 else:
                     state["ignore_streak"] = 0
                     for it in _items(state):
                         if it.id == pending.get("item_id") and it.is_open():
                             it.last_nudged_at = max(it.last_nudged_at or 0, now)
                     _mutate_items(state, _items(state))
-                rt["pending"] = None
+                    rt["pending"] = None
                 S.log_decision({"ts": now, "event": "feedback", "reason": outcome, "outcome": outcome,
                                 "item_id": pending.get("item_id"),
                                 "adaptive_offset": state["adaptive_offset"],
