@@ -80,9 +80,9 @@ decayed = base × (0.40 + 0.60·连续性)          # 连续性 = 0.97^天数
 | `cooldown_minutes` | 40 | 两条主动消息的最小间隔（紧急事项压到 1/3） |
 | `daily_budget` | 8 | 每日上限（再被档位上限压一次） |
 | `threshold` | 0.62 | 显著性门槛 |
-| `delivery_mode` | platform:qqbot | platform:<名字> 单平台 / platforms:<a,b> 多平台 / active 白名单内已有会话的平台（all 已废弃） |
-| `allowed_platforms` | `["qqbot"]` | 平台白名单；留空则一律不发 |
-| `require_direct` | true | 只投私聊；判不出私聊的会话（桌面）也拒 |
+| `delivery_mode` | active | active 白名单内每个已建会话的平台各发一条 / platform:<名字> 单平台 / platforms:<a,b> 多平台（all 已废弃） |
+| `allowed_platforms` | `["*"]` | 允许的平台。`*` = 任何已接通的平台；留空则一律不发 |
+| `require_direct` | true | 只投私聊；群聊、频道、线程与判不出私聊的会话（桌面）一律拒 |
 | `research_enabled` | true | 期限窗口内先联网查资料 |
 | `research_window_hours` | 72 | 多远内的期限才触发研究 |
 | `research_daily_cap` | 6 | 每天最多研究几次 |
@@ -897,3 +897,49 @@ WRITE: 输入 title / due_human / reason / intel / voice → 只输出一句话
 | 权重 | 1.000 | 0.808 | 0.760 | 0.813 | 0.907 | 1.000 |
 
 谷底在第 9–11 天（0.76）。逻辑是：**刚答应的事靠新鲜度提醒，扛过三周的承诺靠"还在"提醒**。
+
+---
+
+## 十九、跨平台：Hermes 接通哪里，就往哪里发（2026-11-07 深夜）
+
+原先默认绑死 QQ。`delivery_mode: platform:qqbot`，白名单只有 `qqbot`。代码本身是通用的，配置却把它锁在一个平台上，改的就是这层锁。
+
+### 平台接通由人做，插件不代劳
+
+一条消息能发到哪里，取决于那个平台有没有会话。会话是人在 Hermes 里接通平台、并在那边说过话之后才出现的。插件不去连 QQ、Telegram、Discord，它只读会话表。
+
+分工因此很清楚：**接通是人做的，判断和发送是插件做的**。装完没在任何平台说过话，一句都不会发。
+
+### 一个通配符代替枚举
+
+```yaml
+delivery_mode: active
+allowed_platforms: ["*"]
+require_direct: true
+```
+
+`*` 只放开平台名这一层，不等于关掉闸门：
+
+| 情境 | 结果 |
+|---|---|
+| qqbot 有私聊会话 | 发 |
+| telegram 接通了、有私聊 | 发 |
+| 接通了但只有群 | 不发 |
+| 桌面（本地会话） | 不发，键里没有平台段 |
+| 名单写成 `[]` | 全不发 |
+
+### active 的语义改了
+
+旧版 active 只挑"最近说话的那一个"会话。现在白名单内每个有会话的平台各发一条。跨平台之后"最近那个"不再等于"唯一那个"——上午在 Telegram 说话、晚上在 QQ 说话，两边都该收到。
+
+### 实测
+
+```
+真实 state（只接通 qqbot）      → qqbot 一条，桌面被挡
+模拟加上 telegram 与 discord    → 三个平台各一条
+模拟 telegram 只有群            → 零条
+```
+
+### 代价
+
+同一条提醒会在多个平台各出现一次。单平台时代这不成问题，跨平台之后是必然。插件不做"哪个平台已读过"的去重，因为那要跨平台读客户端状态，超出它的能力边界，也超出它该有的权限。嫌吵就把白名单收窄回一个平台。

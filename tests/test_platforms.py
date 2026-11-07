@@ -20,7 +20,8 @@ PLUGIN_DIR = Path(__file__).resolve().parent.parent
 if str(PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(PLUGIN_DIR))
 
-from platforms import classify, describe, is_allowed_target, parse, platform_of  # noqa: E402
+from platforms import (classify, describe, in_allowlist, is_allowed_target,  # noqa: E402
+                       parse, platform_of)
 
 QQ_DM = "agent:main:qqbot:dm:<qq_id>"
 QQ_GROUP = "agent:main:qqbot:group:123456789"
@@ -116,6 +117,38 @@ class TestAllowedTarget(unittest.TestCase):
     def test_group_passes_when_direct_not_required(self):
         ok, why = is_allowed_target(TG_GROUP, "telegram", ["telegram"], False)
         self.assertTrue(ok, why)
+
+
+class TestWildcard(unittest.TestCase):
+    """`*` 把"往哪发"交给宿主：接通了才有会话，没接通自然发不出去。"""
+
+    def test_matches_any_platform(self):
+        for plat in ("qqbot", "telegram", "discord", "slack", "wechat"):
+            self.assertTrue(in_allowlist(plat, ["*"]), plat)
+
+    def test_wildcard_does_not_disable_triangle(self):
+        """通配只放开平台名，不放开群聊。"""
+        ok, why = is_allowed_target(TG_GROUP, "telegram", ["*"], True)
+        self.assertFalse(ok)
+        self.assertTrue(why.startswith("not-direct"))
+
+    def test_wildcard_still_blocks_unknown(self):
+        ok, why = is_allowed_target(DESKTOP, "desktop", ["*"], True)
+        self.assertFalse(ok)
+        self.assertEqual(why, "not-direct:unknown")
+
+    def test_empty_is_not_wildcard(self):
+        self.assertFalse(in_allowlist("qqbot", []))
+        ok, why = is_allowed_target(QQ_DM, "qqbot", [], True)
+        self.assertFalse(ok)
+        self.assertEqual(why, "no-allowlist")
+
+    def test_named_allowlist_beats_wildcard_absence(self):
+        self.assertTrue(in_allowlist("qqbot", ["qqbot"]))
+        self.assertFalse(in_allowlist("telegram", ["qqbot"]))
+
+    def test_wildcard_with_names_is_tolerated(self):
+        self.assertTrue(in_allowlist("telegram", ["*", "qqbot"]))
 
 
 if __name__ == "__main__":

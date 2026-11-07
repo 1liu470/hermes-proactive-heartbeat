@@ -38,6 +38,7 @@ GROUP_KEY = "agent:main:qqbot:group:123456789"
 DESKTOP_KEY = "20260101_000000_abcdef"
 TG_DM = "agent:main:telegram:dm:555000111"
 TG_GROUP = "agent:main:telegram:group:-100777"
+DC_DM = "agent:main:discord:dm:987654321"
 
 
 class Ctx:
@@ -201,6 +202,72 @@ class TestDirectOnly(unittest.TestCase):
         self.assertTrue(ok, "显式关掉才允许群发")
 
 
+class TestActiveAnywhere(unittest.TestCase):
+    """active + `*`：Hermes 接通了哪个平台，就往哪个平台的私聊发。
+
+    平台接通这一步由人做——接不通就没有会话，插件不会凭空造一个。
+    """
+
+    def test_reaches_every_connected_platform(self):
+        ctx = Ctx(delivery_mode="active", allowed_platforms=["*"], require_direct=True)
+        st = state_with({"qqbot": {"key": DM_KEY, "at": 100},
+                         "telegram": {"key": TG_DM, "at": 300},
+                         "discord": {"key": DC_DM, "at": 200}})
+        ok, used = mod._deliver(ctx, st, "hi", 0)
+        self.assertTrue(ok)
+        self.assertEqual(set(ctx.sent), {DM_KEY, TG_DM, DC_DM})
+        self.assertEqual(set(used.split(",")), {"qqbot", "telegram", "discord"})
+
+    def test_only_connected_platforms(self):
+        """telegram 没接通就别想着往那儿发。"""
+        ctx = Ctx(delivery_mode="active", allowed_platforms=["*"], require_direct=True)
+        ok, used = mod._deliver(ctx, state_with({"qqbot": {"key": DM_KEY, "at": 1}}), "hi", 0)
+        self.assertTrue(ok)
+        self.assertEqual(ctx.sent, [DM_KEY])
+
+    def test_desktop_excluded(self):
+        ctx = Ctx(delivery_mode="active", allowed_platforms=["*"], require_direct=True)
+        st = state_with({"desktop": {"key": DESKTOP_KEY, "at": 999},
+                         "qqbot": {"key": DM_KEY, "at": 100}})
+        ok, used = mod._deliver(ctx, st, "hi", 0)
+        self.assertTrue(ok)
+        self.assertEqual(ctx.sent, [DM_KEY])
+        self.assertNotIn(DESKTOP_KEY, ctx.sent)
+
+    def test_groups_still_blocked(self):
+        """接通了但只有群会话，那就一条也不发——不因为放开跨平台就发到群里。"""
+        ctx = Ctx(delivery_mode="active", allowed_platforms=["*"], require_direct=True)
+        st = state_with({"telegram": {"key": TG_GROUP, "at": 1},
+                         "discord": {"key": "agent:main:discord:channel:123", "at": 2}})
+        ok, used = mod._deliver(ctx, st, "hi", 0)
+        self.assertFalse(ok)
+        self.assertEqual(ctx.sent, [])
+
+    def test_mixed_direct_and_group(self):
+        ctx = Ctx(delivery_mode="active", allowed_platforms=["*"], require_direct=True)
+        st = state_with({"qqbot": {"key": DM_KEY, "at": 1},
+                         "telegram": {"key": TG_GROUP, "at": 2}})
+        ok, used = mod._deliver(ctx, st, "hi", 0)
+        self.assertTrue(ok)
+        self.assertEqual(ctx.sent, [DM_KEY])
+
+    def test_explicit_allowlist_narrows_it(self):
+        """白名单写了具体平台，即使接通了别的也不发。"""
+        ctx = Ctx(delivery_mode="active", allowed_platforms=["qqbot"], require_direct=True)
+        st = state_with({"qqbot": {"key": DM_KEY, "at": 1},
+                         "telegram": {"key": TG_DM, "at": 2}})
+        ok, used = mod._deliver(ctx, st, "hi", 0)
+        self.assertTrue(ok)
+        self.assertEqual(ctx.sent, [DM_KEY])
+
+    def test_no_sessions_means_silence(self):
+        """一个平台都没接通，就一句话都不说。"""
+        ctx = Ctx(delivery_mode="active", allowed_platforms=["*"], require_direct=True)
+        ok, used = mod._deliver(ctx, state_with({}), "hi", 0)
+        self.assertFalse(ok)
+        self.assertEqual(ctx.sent, [])
+
+
 class TestDefaultsAreStrict(unittest.TestCase):
     def test_plugin_defaults_block_desktop(self):
         """默认配置下（不传任何 settings），桌面必须发不出去。"""
@@ -208,6 +275,16 @@ class TestDefaultsAreStrict(unittest.TestCase):
         ok, used = mod._deliver(ctx, state_with(ALL_SESSIONS), "hi", 0)
         self.assertEqual(ctx.sent, [DM_KEY])
         self.assertNotIn(DESKTOP_KEY, ctx.sent)
+
+    def test_defaults_reach_multiple_platforms(self):
+        """默认就是 active + `*`，接通的平台都该收到。"""
+        ctx = Ctx()
+        st = state_with({"qqbot": {"key": DM_KEY, "at": 1},
+                         "telegram": {"key": TG_DM, "at": 2},
+                         "desktop": {"key": DESKTOP_KEY, "at": 3}})
+        ok, used = mod._deliver(ctx, st, "hi", 0)
+        self.assertTrue(ok)
+        self.assertEqual(set(ctx.sent), {DM_KEY, TG_DM})
 
 
 if __name__ == "__main__":

@@ -72,16 +72,16 @@ config_schema:
     description: "同一假设多少天内不重复"
   delivery_mode:
     type: string
-    default: "platform:qqbot"
-    description: "投递路由：platform:<名字> 单平台 / platforms:<a,b> 多平台 / active 白名单内已建会话的平台。all 已废弃（它会广播），配了也不发"
+    default: "active"
+    description: "投递路由：active 白名单内每个已建会话的平台各发一条 / platform:<名字> 单平台 / platforms:<a,b> 多平台。all 已废弃（它会广播），配了也不发"
   allowed_platforms:
     type: list
-    default: ["qqbot"]
-    description: "只允许投递到这些平台；留空则一律不发。多平台写 [\"qqbot\",\"telegram\"]"
+    default: ["*"]
+    description: "允许投递的平台。* = 任何已接通的平台（接通由人完成，没接通就没有会话）；留空则一律不发；也可写 [\"qqbot\",\"telegram\"] 限定"
   require_direct:
     type: bool
     default: true
-    description: "只投私聊会话。会话键里判不出私聊的（如桌面纯会话号）也拒"
+    description: "只投私聊。群聊、频道、线程一律拒；判不出私聊的会话（如桌面）也拒"
   research_enabled:
     type: bool
     default: true

@@ -73,10 +73,13 @@ DEFAULTS: Dict[str, Any] = {
     "sense_enabled": True,
     "sense_daily_cap": 2,
     "sense_repeat_days": 7,
-    # 投递路由：active（最近说话的那个会话）/ all（所有活跃平台）/ platform:<名字>
-    "delivery_mode": "platform:qqbot",
+    # 投递路由：active（白名单内每个已建会话的平台各发一条）/ platform:<名字>（单平台）
+    # / platforms:<a,b>（多平台）。all 已删除，它的语义是广播。
+    "delivery_mode": "active",
     # 硬闸一：只有这些平台允许投递。留空 = 一律不发（fail closed）。
-    "allowed_platforms": ["qqbot"],
+    # `*` = 任何已接通的平台。平台是否接通由人决定，插件不代为连接；
+    # 没接通的平台没有会话，也就发不出去。
+    "allowed_platforms": ["*"],
     # 硬闸二：只投私聊，不进群。靠 session_key 里的 :dm:/:private: 一类标记判断。
     "require_direct": True,
     "threshold": 0.62,
@@ -456,7 +459,7 @@ def _want_platforms(mode: str) -> list:
 
         platform:qqbot              单平台（旧写法，保留）
         platforms:qqbot,telegram    多平台
-        active                      白名单内、已经建立过会话的平台
+        active                      白名单内、已经建立过会话的每个平台（由 _deliver 展开）
         all                         已删除——它的语义是广播
 
     认不出的写法返回空，由调用方决定是走白名单回退还是不发。
@@ -500,7 +503,10 @@ def _deliver(ctx, state: Dict[str, Any], content: str, now: float) -> tuple:
 
     wants = _want_platforms(mode)
     if mode == "active":
-        wants = [p for p in allowed if (sessions.get(p) or {}).get("key")]
+        # 白名单内的每一个平台都发，不限最近一个。白名单若含 `*`，
+        # 那就是所有已接通且有私聊会话的平台——接不通的没有会话，自然不会出现在这里。
+        wants = [p for p, v in sessions.items()
+                 if (v or {}).get("key") and PF.in_allowlist(p, allowed)]
 
     targets = [(p, (sessions.get(p) or {}).get("key")) for p in wants]
     targets = [(p, k) for p, k in targets if k]
@@ -508,7 +514,7 @@ def _deliver(ctx, state: Dict[str, Any], content: str, now: float) -> tuple:
     if not targets:
         cand = [(p, v.get("key"), float(v.get("at") or 0))
                 for p, v in sessions.items()
-                if v.get("key") and str(p).lower() in allowed]
+                if v.get("key") and PF.in_allowlist(p, allowed)]
         if cand:
             cand.sort(key=lambda x: x[2], reverse=True)
             targets = [(cand[0][0], cand[0][1])]

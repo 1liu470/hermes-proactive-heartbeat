@@ -88,6 +88,25 @@ def describe(key: str) -> str:
     return f"local/{kind}"
 
 
+#: 白名单里的通配符：任何已接通的平台。
+WILDCARD = "*"
+
+
+def in_allowlist(platform: str, allowed: list) -> bool:
+    """平台是否在白名单内。
+
+    `*` 匹配任何平台名——它把"往哪发"交给宿主：Hermes 接通的平台才会
+    在会话表里出现，没接通就没有会话，也就发不出去。空名单仍然是全拒，
+    通配符不等于"不限制"。
+    """
+    if not allowed:
+        return False
+    names = [str(x).strip().lower() for x in allowed]
+    if WILDCARD in names:
+        return True
+    return str(platform or "").strip().lower() in names
+
+
 def is_allowed_target(key: str, platform: str, allowed: list, require_direct: bool) -> tuple:
     """返回 (能不能发, 拒因)。
 
@@ -97,7 +116,7 @@ def is_allowed_target(key: str, platform: str, allowed: list, require_direct: bo
     plat = str(platform or "").strip().lower()
     if not allowed:
         return False, "no-allowlist"
-    if plat not in allowed:
+    if not in_allowlist(plat, allowed):
         return False, "platform"
     key_plat = platform_of(key)
     if key_plat and plat and key_plat != plat:
