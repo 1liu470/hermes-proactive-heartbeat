@@ -173,11 +173,39 @@ def release_tick_lock(fd: Optional[int]) -> None:
         pass
 
 
+_LOG_MAX_BYTES = 1_000_000   # 超过就轮转
+_LOG_KEEP_LINES = 1500       # 轮转后保留的尾部行数
+
+
+def _rotate_decisions(path: Path) -> None:
+    """把日志截到最近 N 行。
+
+    不轮转的后果是实测过的：一个有 bug 的钩子每几分钟写一行同样的反馈，
+    一天就把文件写到 136K，全是重复行，真正该看的那几条埋在里面。
+    轮转只保尾部——最新的才是有用的。
+    """
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return
+    if len(lines) <= _LOG_KEEP_LINES:
+        return
+    tmp = path.with_suffix(".tmp")
+    try:
+        tmp.write_text("\n".join(lines[-_LOG_KEEP_LINES:]) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
 def log_decision(record: Dict[str, Any]) -> None:
     with _LOCK:
         try:
-            with decisions_path().open("a", encoding="utf-8") as fh:
+            path = decisions_path()
+            with path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            if path.stat().st_size > _LOG_MAX_BYTES:
+                _rotate_decisions(path)
         except Exception:
             pass
 

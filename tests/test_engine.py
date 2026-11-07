@@ -155,6 +155,23 @@ class TestGate(unittest.TestCase):
         v = self._gate(items=[_item(nudges=2, last_nudged_at=NOW - 1800)])
         self.assertFalse(v.allowed)
 
+    def test_nudge_cap_is_hard_even_when_score_is_high(self):
+        """分数够高也不能无限复述。同一条会址集合三天里发过三次，就是缺这道闸。"""
+        v = self._gate(items=[_item(nudges=2, due=NOW + 86400, weight=1.0)])
+        self.assertFalse(v.allowed)
+        self.assertEqual(v.reason, "no_open_items")
+
+    def test_nudge_cap_grants_one_extra_for_a_closing_deadline(self):
+        """硬期限临门允许突破一次——那是最后一次值得打断的机会。"""
+        v = self._gate(items=[_item(nudges=2, due=NOW + 3 * 3600, weight=1.0)])
+        self.assertTrue(v.allowed)
+        again = self._gate(items=[_item(nudges=3, due=NOW + 3 * 3600, weight=1.0)])
+        self.assertFalse(again.allowed)
+
+    def test_nudge_cap_is_configurable(self):
+        v = self._gate(items=[_item(nudges=3, due=NOW + 86400, weight=1.0)], max_nudges=4)
+        self.assertTrue(v.allowed)
+
     def test_adaptive_offset_raises_the_bar(self):
         ok = self._gate()
         self.assertTrue(ok.allowed)
@@ -173,6 +190,17 @@ class TestFeedback(unittest.TestCase):
         self.assertEqual(classify_feedback(pending, NOW + 3600, False), "ignored")
         self.assertIsNone(classify_feedback(None, NOW, True))
 
+    def test_expired_probe_is_dropped_not_judged(self):
+        """隔了一天再回一句"好的"，不该算有效，也不该算无视——两者都在污染账本。"""
+        stale = {"at": NOW - 13 * 3600, "title": "确认集合"}
+        self.assertEqual(classify_feedback(stale, NOW, True, "好的"), "expired")
+        # 窗口内仍正常归因
+        fresh = {"at": NOW - 10 * 60, "title": "确认集合"}
+        self.assertEqual(classify_feedback(fresh, NOW, True, "好的"), "engaged")
+        # 边界：正好 12 小时仍算窗口内
+        edge = {"at": NOW - 12 * 3600 + 60, "title": "确认集合"}
+        self.assertNotEqual(classify_feedback(edge, NOW, True, "好的"), "expired")
+
     def test_offset_moves_both_ways_with_caps(self):
         self.assertEqual(next_adaptive_offset(0.0, "ignored"), 0.04)
         self.assertEqual(next_adaptive_offset(0.12, "ignored"), 0.14)
@@ -186,8 +214,6 @@ class TestFeedback(unittest.TestCase):
         self.assertEqual(DIALS["off"][1], 0)
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
 
 class TestContinuityCurve(unittest.TestCase):
     """长期承诺不能因为「放得久」而被折价。
@@ -222,3 +248,7 @@ class TestContinuityCurve(unittest.TestCase):
     def test_day_ten_beats_plain_decay(self):
         """旧公式同一天只有 0.737，新曲线必须高于它。"""
         self.assertGreater(self._val(10), 0.97 ** 10)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

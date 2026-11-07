@@ -59,6 +59,7 @@ DEFAULTS: Dict[str, Any] = {
     # 紧急通道：硬期限进入窗口后，用户只需静默这么久就能被提醒一次
     "urgent_window_hours": 6,
     "urgent_min_idle_seconds": 180,
+    "max_nudges": 2,
     # 主动研究：进入期限窗口时先替他查一次资料，再决定怎么说
     "research_enabled": True,
     "research_window_hours": 72,
@@ -194,6 +195,31 @@ def _items(state: Dict[str, Any]) -> List[E.Item]:
         except Exception:
             continue
     return out
+
+
+def _commit(mutator) -> None:
+    """唯一安全的写入口：在锁内读取磁盘最新状态，再施加增量。
+
+    为什么不能用 load() → 改 → save()：两步之间锁已释放，而心跳一次 tick
+    会在模型调用与联网检索上停留数秒。这期间 hook 清掉的 pending、刷新的
+    last_user_turn_at，会被心跳手里那份几秒前的快照整份写回，效果等于从没改过。
+    实测症状：pending 卡在一天前不消失、每轮对话反复结算同一条反馈、
+    adaptive_offset 在 0.0 与 0.04 之间来回跳。
+    """
+    S.update(mutator)
+
+
+def _stats_inc(st: Dict[str, Any], key: str, n: int = 1) -> None:
+    stats = st.setdefault("stats", {})
+    stats[key] = int(stats.get(key) or 0) + n
+
+
+def _reason_kind(reason: Any) -> str:
+    """拒因归类：`below_threshold(0.619<0.62)` 与 `below_threshold(0.618<0.62)` 同类。
+
+    日志去重若拿整串比分，分数每轮都在动，全天每 15 分钟就会落一行相同的拒绝。
+    """
+    return str(reason or "").split("(", 1)[0].strip()
 
 
 def _mutate_items(state: Dict[str, Any], items: List[E.Item]) -> None:
@@ -342,6 +368,21 @@ def _clean_draft(text: str) -> str:
     s = (text or "").strip()
     s = re.sub(r"^```[a-zA-Z]*\s*", "", s)
     s = re.sub(r"\s*```$", "", s).strip()
+    # 有的模型在"只写一句话"的阶段仍回一整个 JSON 对象。照原样发出去，
+    # 用户收到的就是 {"send": true, "message": ...}。这里先把壳剥掉。
+    if s.startswith("{") and s.endswith("}"):
+        try:
+            obj = json.loads(s)
+        except Exception:
+            obj = None
+        if isinstance(obj, dict):
+            for key in ("message", "text", "content", "reply"):
+                val = obj.get(key)
+                if isinstance(val, str) and val.strip():
+                    s = val.strip()
+                    break
+            else:
+                s = ""
     for left, right in (('"', '"'), ("'", "'"), ("“", "”"), ("「", "」"), ("‘", "’")):
         if len(s) > 2 and s.startswith(left) and s.endswith(right):
             s = s[1:-1].strip()
@@ -568,19 +609,23 @@ def _tick_body(ctx) -> None:
         urgent_window_hours=float(_cfg(ctx, "urgent_window_hours") or 6),
         urgent_min_idle_seconds=float(_cfg(ctx, "urgent_min_idle_seconds") or 180),
         type_stats=state.get("type_stats") or {},
+        max_nudges=int(_cfg(ctx, "max_nudges") or 2),
     )
 
-    state["stats"]["considered"] = int(state["stats"].get("considered") or 0) + 1
+    _commit(lambda st: _stats_inc(st, "considered"))
 
     if not verdict.allowed:
-        state["stats"]["gated"] = int(state["stats"].get("gated") or 0) + 1
-        # Log only transitions, not every quiet tick — the trail stays readable.
-        if rt.get("last_gate_reason") != verdict.reason:
-            rt["last_gate_reason"] = verdict.reason
-            S.save(state)
+        kind = _reason_kind(verdict.reason)
+        changed = _reason_kind(rt.get("last_gate_reason")) != kind
+
+        def _record_gate(st: Dict[str, Any]) -> None:
+            _stats_inc(st, "gated")
+            st["runtime"]["last_gate_reason"] = verdict.reason
+
+        _commit(_record_gate)
+        # 只在拒因类型切换时落一行。分数每 tick 都在动，按整串比对等于全天刷屏。
+        if changed:
             S.log_decision({"ts": now, "event": "gate", **verdict.to_log()})
-        else:
-            S.save(state)
         return
 
     item = verdict.item
@@ -596,16 +641,17 @@ def _tick_body(ctx) -> None:
     intel = RS.format_intel(hits)
     decision = _ask_model(ctx, item, verdict.components, now, related, intel)
     if not decision or not decision["send"]:
-        state["stats"]["declined_by_model"] = int(state["stats"].get("declined_by_model") or 0) + 1
-        rt["last_gate_reason"] = "model_declined"
-        S.save(state)
+        def _record_declined(st: Dict[str, Any]) -> None:
+            _stats_inc(st, "declined_by_model")
+            st["runtime"]["last_gate_reason"] = "model_declined"
+
+        _commit(_record_declined)
         S.log_decision({"ts": now, "event": "declined", **verdict.to_log(),
                         "model_reason": (decision or {}).get("reason", "no_answer")})
         return
 
     if not (rt.get("last_session_key") or rt.get("sessions")):
-        rt["last_gate_reason"] = "no_session"
-        S.save(state)
+        _commit(lambda st: st["runtime"].__setitem__("last_gate_reason", "no_session"))
         S.log_decision({"ts": now, "event": "no_session", **verdict.to_log()})
         return
 
@@ -627,39 +673,43 @@ def _tick_body(ctx) -> None:
     ok, landed = _deliver(ctx, state, content, now)
     if not ok:
         log.warning("proactive: injection failed on every target")
-        rt["last_gate_reason"] = "inject_rejected"
-        S.save(state)
+        _commit(lambda st: st["runtime"].__setitem__("last_gate_reason", "inject_rejected"))
         S.log_decision({"ts": now, "event": "inject_rejected", **verdict.to_log()})
         return
 
     # Sent: spend budget, arm the feedback probe, mark the item.
-    item.nudges += 1
-    item.last_nudged_at = now
-    if item.id.startswith("sense:"):
-        SN.mark(state, item.id.split(":", 1)[1], now)
-    for idx, existing in enumerate(items):
-        if existing.id == item.id:
-            items[idx] = item
-            break
-    _mutate_items(state, items)
-    # 消息里合并进去的其他条目也要标记，否则下一轮还会被当作新鲜候选再说一遍
-    for n in decision.get("used") or []:
-        candidates = decision.get("candidates") or []
-        if 1 < n <= len(candidates):
-            extra = candidates[n - 1]
-            extra.nudges += 1
-            extra.last_nudged_at = now
-    rt["daily_count"] = int(rt.get("daily_count") or 0) + 1
-    rt["last_injection_at"] = now
-    rt["last_gate_reason"] = "sent"
+    # 全部在锁内基于磁盘最新状态记账。拿 tick 开头那份快照整份写回，
+    # 会把这几秒里用户新记的事项、hook 清掉的 pending 一起抹掉。
     itype = E.item_type(item)
-    ts = state.setdefault("type_stats", {}).setdefault(itype, {"sent": 0, "engaged": 0})
-    ts["sent"] = int(ts.get("sent") or 0) + 1
-    rt["pending"] = {"item_id": item.id, "at": now, "session_key": rt.get("last_session_key"),
-                     "platforms": landed, "title": item.title, "type": itype,
-                     "at_local": datetime.fromtimestamp(now, tz).isoformat()}
-    state["stats"]["sent"] = int(state["stats"].get("sent") or 0) + 1
-    S.save(state)
+    sense_id = item.id.split(":", 1)[1] if item.id.startswith("sense:") else ""
+    extra_ids = set()
+    for n in decision.get("used") or []:
+        cands = decision.get("candidates") or []
+        if 1 < n <= len(cands):
+            extra_ids.add(cands[n - 1].id)
+
+    def _arm(st: Dict[str, Any]) -> None:
+        fresh = _items(st)
+        for it in fresh:
+            if it.id == item.id or it.id in extra_ids:
+                it.nudges += 1
+                it.last_nudged_at = now
+        _mutate_items(st, fresh)
+        if sense_id:
+            SN.mark(st, sense_id, now)
+        r = st["runtime"]
+        r["daily_count"] = int(r.get("daily_count") or 0) + 1
+        r["last_injection_at"] = now
+        r["last_gate_reason"] = "sent"
+        r["pending"] = {"item_id": item.id, "at": now,
+                        "session_key": r.get("last_session_key"),
+                        "platforms": landed, "title": item.title, "type": itype,
+                        "at_local": datetime.fromtimestamp(now, tz).isoformat()}
+        ts = st.setdefault("type_stats", {}).setdefault(itype, {"sent": 0, "engaged": 0})
+        ts["sent"] = int(ts.get("sent") or 0) + 1
+        _stats_inc(st, "sent")
+
+    _commit(_arm)
     S.log_decision({"ts": now, "event": "sent", **verdict.to_log(),
                     "message": decision["message"], "platforms": landed})
 
@@ -721,83 +771,92 @@ def _on_pre_llm_call(**kw: Any) -> Optional[Dict[str, str]]:
         return None
 
     now = time.time()
+    tz = _tz()
     session_key = _session_env("HERMES_SESSION_KEY")
     outcome = None
     block = ""
 
     try:
-        state = S.load()
-        rt = state["runtime"]
-        _roll_day(state, now)
+        with S.transaction() as state:
+            rt = state["runtime"]
+            _roll_day(state, now)
 
-        pending = rt.get("pending")
-        if pending and platform in SKIP_PLATFORMS:
-            outcome = None  # an unattended run is not a human answer
-        elif pending:
-            # Any human turn inside the window counts as "not ignored" — our own
-            # injection is marker-guarded above and unattended runs are filtered just
-            # above, so this only fires on a real person.  The session_key decides
-            # *delivery*, not whether the user answered.
-            outcome = E.classify_feedback(pending, now, user_replied=True,
-                                          user_text=str(text or ""))
-
-        if outcome:
-            state["adaptive_offset"] = E.next_adaptive_offset(
-                float(state.get("adaptive_offset") or 0.0), outcome)
-            # 类型级账本：哪一类提醒他真的会动，单独记
-            ptype = str((pending or {}).get("type") or "")
-            if ptype and outcome == "engaged":
-                ts = state.setdefault("type_stats", {}).setdefault(ptype, {"sent": 0, "engaged": 0})
-                ts["engaged"] = int(ts.get("engaged") or 0) + 1
-            if outcome == "ignored":
-                state["ignore_streak"] = int(state.get("ignore_streak") or 0) + 1
+            pending = rt.get("pending")
+            if pending and platform in SKIP_PLATFORMS:
+                outcome = None  # an unattended run is not a human answer
+            elif pending:
+                # Any human turn inside the window counts as "not ignored" — our own
+                # injection is marker-guarded above and unattended runs are filtered just
+                # above, so this only fires on a real person.  The session_key decides
+                # *delivery*, not whether the user answered.
+                outcome = E.classify_feedback(pending, now, user_replied=True,
+                                              user_text=str(text or ""))
             else:
-                state["ignore_streak"] = 0
-                for it in _items(state):
-                    if it.id == pending.get("item_id") and it.is_open():
-                        it.last_nudged_at = max(it.last_nudged_at or 0, now)
-                _mutate_items(state, _items(state))
-            rt["pending"] = None
-            S.log_decision({"ts": now, "event": "feedback", "reason": outcome, "outcome": outcome,
-                            "item_id": pending.get("item_id"),
-                            "adaptive_offset": state["adaptive_offset"],
-                            "ignore_streak": state["ignore_streak"]})
+                outcome = None
 
-        # Refresh activity + per-platform session keys.
-        if platform not in SKIP_PLATFORMS:
-            rt["last_user_turn_at"] = now
-            if session_key:
-                rt["last_session_key"] = session_key
-            if platform:
-                rt["last_platform"] = platform
-            if platform and session_key:
-                sessions = rt.setdefault("sessions", {})
-                sessions[platform] = {"key": session_key, "at": now}
-                if len(sessions) > 8:
-                    keep = sorted(sessions.items(), key=lambda kv: float(kv[1].get("at") or 0))[-8:]
-                    rt["sessions"] = dict(keep)
-        if text:
-            merged = set(rt.get("context_terms") or []) | E.terms(text)
-            rt["context_terms"] = sorted(merged)[-60:]
-            # 频次账：只保留集合判断不出"他反复提这件事"，需要出现次数与首末时间
-            stats = rt.setdefault("term_stats", {})
-            day = E.local_day_key(now, tz)
-            for t in E.terms(text):
-                s = stats.get(t) or {"n": 0, "first": now, "last": now, "days": []}
-                s["n"] = int(s.get("n") or 0) + 1
-                s["last"] = now
-                days = s.setdefault("days", [])
-                if day not in days:
-                    days.append(day)
-                    s["days"] = days[-30:]      # 只留最近 30 个日期
-                stats[t] = s
-            if len(stats) > 400:
-                drop = sorted(stats.items(), key=lambda kv: float(kv[1].get("last") or 0))[:-200]
-                for k, _ in drop:
-                    stats.pop(k, None)
-            rt["context_updated_at"] = now
+            if outcome == "expired":
+                # 过了应答窗口就丢弃：不计 offset，也不记 ignore。
+                # 一条一天前的提醒，今天随口回句"好的"记成有效会一路调低门槛；
+                # 记成无视更是凭空记账。两种归因都不如作废。
+                rt["pending"] = None
+                S.log_decision({"ts": now, "event": "feedback", "reason": "expired",
+                                "outcome": "expired", "item_id": pending.get("item_id"),
+                                "age_hours": round((now - float(pending.get("at") or now)) / 3600.0, 1)})
+            elif outcome:
+                state["adaptive_offset"] = E.next_adaptive_offset(
+                    float(state.get("adaptive_offset") or 0.0), outcome)
+                # 类型级账本：哪一类提醒他真的会动，单独记
+                ptype = str((pending or {}).get("type") or "")
+                if ptype and outcome == "engaged":
+                    ts = state.setdefault("type_stats", {}).setdefault(ptype, {"sent": 0, "engaged": 0})
+                    ts["engaged"] = int(ts.get("engaged") or 0) + 1
+                if outcome == "ignored":
+                    state["ignore_streak"] = int(state.get("ignore_streak") or 0) + 1
+                else:
+                    state["ignore_streak"] = 0
+                    for it in _items(state):
+                        if it.id == pending.get("item_id") and it.is_open():
+                            it.last_nudged_at = max(it.last_nudged_at or 0, now)
+                    _mutate_items(state, _items(state))
+                rt["pending"] = None
+                S.log_decision({"ts": now, "event": "feedback", "reason": outcome, "outcome": outcome,
+                                "item_id": pending.get("item_id"),
+                                "adaptive_offset": state["adaptive_offset"],
+                                "ignore_streak": state["ignore_streak"]})
 
-        S.save(state)
+            # Refresh activity + per-platform session keys.
+            if platform not in SKIP_PLATFORMS:
+                rt["last_user_turn_at"] = now
+                if session_key:
+                    rt["last_session_key"] = session_key
+                if platform:
+                    rt["last_platform"] = platform
+                if platform and session_key:
+                    sessions = rt.setdefault("sessions", {})
+                    sessions[platform] = {"key": session_key, "at": now}
+                    if len(sessions) > 8:
+                        keep = sorted(sessions.items(), key=lambda kv: float(kv[1].get("at") or 0))[-8:]
+                        rt["sessions"] = dict(keep)
+            if text:
+                merged = set(rt.get("context_terms") or []) | E.terms(text)
+                rt["context_terms"] = sorted(merged)[-60:]
+                # 频次账：只保留集合判断不出"他反复提这件事"，需要出现次数与首末时间
+                stats = rt.setdefault("term_stats", {})
+                day = E.local_day_key(now, tz)
+                for t in E.terms(text):
+                    s = stats.get(t) or {"n": 0, "first": now, "last": now, "days": []}
+                    s["n"] = int(s.get("n") or 0) + 1
+                    s["last"] = now
+                    days = s.setdefault("days", [])
+                    if day not in days:
+                        days.append(day)
+                        s["days"] = days[-30:]      # 只留最近 30 个日期
+                    stats[t] = s
+                if len(stats) > 400:
+                    drop = sorted(stats.items(), key=lambda kv: float(kv[1].get("last") or 0))[:-200]
+                    for k, _ in drop:
+                        stats.pop(k, None)
+                rt["context_updated_at"] = now
 
         # A compact intent block, rare and only when something is actually close.
         items = [i for i in _items(state) if i.is_open()]
@@ -811,7 +870,10 @@ def _on_pre_llm_call(**kw: Any) -> Optional[Dict[str, str]]:
                         "\n（未到期的先别提前催；需要记新事项可用 proactive_intent 工具。）"
                 S.update(lambda st: st["runtime"].__setitem__("last_intent_block_at", now))
     except Exception:
-        log.warning("proactive: pre_llm_call bookkeeping failed", exc_info=True)
+        # 用 error 而不是 warning：这里一炸，整个钩子静默失效——
+        # pending 清不掉、活跃时间不刷新、账本一个字节都不落盘，
+        # 而外部看起来一切正常。这个级别让它在默认日志里也现形。
+        log.error("proactive: pre_llm_call bookkeeping failed", exc_info=True)
 
     return {"context": block} if block else None
 
@@ -991,27 +1053,35 @@ _HELP = (
 )
 
 
-def _purge(state: Dict[str, Any], now: float, stale_days: float = 30.0) -> str:
+def _purge(now: float, stale_days: float = 30.0) -> str:
     """清掉残留：逾期超过 N 天仍未完成的、以及已完成超过 7 天的。
 
     不做这件事的后果很实在——事项表只增不减，三个月后每一天都在拿
     几十条死事项去算分数，真正该说的那条被稀释掉。
+
+    自己开事务，不接收外面传进来的 state：清理是就地删改整表，
+    拿别人的快照写回去，等于把这期间新记的事项一起删了。
     """
-    items = _items(state)
-    keep, dropped = [], 0
-    for it in items:
-        if it.status == "done":
-            if now - float(it.last_nudged_at or 0) > 7 * 86400:
+    out = {"dropped": 0, "kept": 0}
+
+    def _do(st: Dict[str, Any]) -> None:
+        items = _items(st)
+        keep, dropped = [], 0
+        for it in items:
+            if it.status == "done":
+                if now - float(it.last_nudged_at or 0) > 7 * 86400:
+                    dropped += 1
+                    continue
+            elif it.due is not None and (now - it.due) > stale_days * 86400:
+                it.status = "dropped"
                 dropped += 1
                 continue
-        elif it.due is not None and (now - it.due) > stale_days * 86400:
-            it.status = "dropped"
-            dropped += 1
-            continue
-        keep.append(it)
-    _mutate_items(state, keep)
-    S.save(state)
-    return f"清掉 {dropped} 条残留，剩 {len(keep)} 条未结。"
+            keep.append(it)
+        _mutate_items(st, keep)
+        out["dropped"], out["kept"] = dropped, len(keep)
+
+    _commit(_do)
+    return f"清掉 {out['dropped']} 条残留，剩 {out['kept']} 条未结。"
 
 
 def _handle_command(raw: str) -> str:
@@ -1064,7 +1134,7 @@ def _handle_command(raw: str) -> str:
             days = float(rest.strip() or 30)
         except ValueError:
             days = 30.0
-        return _purge(state, time.time(), days)
+        return _purge(time.time(), days)
 
     if verb == "add":
         bits = rest.split()

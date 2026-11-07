@@ -1,5 +1,5 @@
 name: proactive-heartbeat
-version: "1.2.0"
+version: "1.3.0"
 description: "主动提醒回路：确定性信号采集 → 显著性门控 → 单次廉价模型裁决 → 注入一轮对话 → 按反馈自调门槛。来源已核：ProactiveAgent 的事件桶心跳与反馈规则、Generative Agents 的显著性打分与注意力预算、Muse 的打断门槛与可调档位。任何异常一律不发言。"
 author: "Hermes (synthesis of thunlp/ProactiveAgent, joonspk-research/generative_agents, Meta Muse design notes)"
 license: "MIT"
@@ -58,6 +58,10 @@ config_schema:
     type: int
     default: 180
     description: "紧急通道要求的最短静默秒数"
+  max_nudges:
+    type: int
+    default: 2
+    description: "同一事项最多提醒几次（硬期限临门时可多一次）"
   sense_enabled:
     type: bool
     default: true

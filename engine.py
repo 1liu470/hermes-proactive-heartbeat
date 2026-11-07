@@ -416,7 +416,8 @@ def gate(*, items: Sequence[Item], now: float, local_hm: int, dial: str,
          last_user_turn_at: Optional[float], ignore_streak: int, context_terms: Set[str],
          adaptive_offset: float = 0.0, skip_reason: str = "",
          urgent_window_hours: float = 6.0, urgent_min_idle_seconds: float = 180.0,
-         type_stats: Optional[Dict[str, Any]] = None) -> Verdict:
+         type_stats: Optional[Dict[str, Any]] = None,
+         max_nudges: int = 2) -> Verdict:
     """The deterministic half of proactivity: everything decidable without a model.
 
     Two idle lanes, not one.  The quiet lane is the default (user must be away for
@@ -446,6 +447,15 @@ def gate(*, items: Sequence[Item], now: float, local_hm: int, dial: str,
     best_comp: Dict[str, float] = {}
     for it in items:
         if not it.is_open() or not it.title:
+            continue
+        # 催满就退场。没有这条上限，一条分数够高的事项会隔几小时再发一次，
+        # 实测同一条会址集合三天里发了三次——用户没回，不代表要再说一遍。
+        # 硬期限临门（6 小时内）例外一次，那是最后一次值得打断的机会。
+        cap = max(1, int(max_nudges))
+        if (it.kind == "deadline" and it.due is not None
+                and 0 <= (it.due - now) <= urgent_window_hours * 3600):
+            cap += 1
+        if it.nudges >= cap:
             continue
         comp = score_item(it, now, context_terms, daily_count=daily_count,
                           daily_budget=budget, ignore_streak=ignore_streak,
@@ -493,6 +503,9 @@ def gate(*, items: Sequence[Item], now: float, local_hm: int, dial: str,
 # --------------------------------------------------------------------------
 
 FEEDBACK_WINDOW_SECS = 45 * 60
+# 应答期限：超过这个时间，pending 一律作废而不归因。
+# 与 WINDOW 的区别——WINDOW 判"没回话算不算无视"，TTL 判"这条 probe 还有没有意义"。
+FEEDBACK_TTL_SECS = 12 * 3600
 
 
 def classify_feedback(pending: Optional[Dict[str, Any]], now: float,
@@ -506,6 +519,11 @@ def classify_feedback(pending: Optional[Dict[str, Any]], now: float,
     if not pending:
         return None
     at = float(pending.get("at") or 0)
+    # 超过应答期限就直接作废。窗口内判 engaged/ignored，窗口外连"回没回"都不可靠：
+    # 一条一天前的提醒，今天随口回句"好的"记成有效会一路调低门槛，
+    # 记成无视则是凭空记账。两种归因都在污染账本，不如丢弃。
+    if now - at > FEEDBACK_TTL_SECS:
+        return "expired"
     if user_replied:
         text = (user_text or "").strip()
         title = str(pending.get("title") or "")

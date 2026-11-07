@@ -117,6 +117,20 @@ class TestDraftCleaning(unittest.TestCase):
     def test_strips_quotes(self):
         self.assertEqual(mod._clean_draft('「明早八点前发过去」'), "明早八点前发过去")
 
+    def test_strips_a_json_envelope(self):
+        """模型在"只写一句话"的阶段仍回 JSON 时，剥壳而不能原样发出去。
+
+        simulate 的 stub 就撞出过这个：注入正文里整段是
+        {"send": true, "message": ..., "reason": ...}。真模型目前没犯，
+        但这条路径此前没有任何防护，模型换一种说法就会原样发到用户手机上。
+        """
+        shell = '{"send": true, "message": "今晚十点前把稳态推导补完", "reason": "临近截止"}'
+        self.assertEqual(mod._clean_draft(shell), "今晚十点前把稳态推导补完")
+        self.assertEqual(mod._clean_draft('{"text": "回一句收到就行"}'), "回一句收到就行")
+        # 剥不出可用的句子就交空串，让调用方整次作废，而不是发一段 JSON
+        self.assertEqual(mod._clean_draft('{"send": false}'), "")
+        self.assertEqual(mod._clean_draft('{"broken": '), '{"broken":')
+
     def test_strips_code_fence(self):
         self.assertEqual(mod._clean_draft("```\n明早八点前发过去\n```"), "明早八点前发过去")
 
