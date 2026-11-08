@@ -717,7 +717,15 @@ def _tick_body(ctx) -> None:
 def _heartbeat(reg: Dict[str, Any]) -> None:
     stop = reg["stop"]
     while True:
+        # 每轮重读配置，而不是信启动时那份快照。用户把 900 改成 120（或反过来）
+        # 之后，读快照要等一个完整旧周期才换挡——长周期下就是十几分钟的迟到生效。
         tick = max(15.0, float(reg.get("interval") or 120))
+        live = reg.get("ctx")
+        if live is not None:
+            try:
+                tick = max(15.0, float(_cfg(live, "tick_seconds") or tick))
+            except Exception:
+                pass
         if stop.wait(tick):
             return
         fn = reg.get("tick_fn")
@@ -738,7 +746,13 @@ def _ensure_thread(ctx) -> None:
         reg["interval"] = max(15.0, float(_cfg(ctx, "tick_seconds") or 120))
         stop = reg.get("stop")
         if stop is not None and stop.is_set():
-            return  # unloaded on purpose; a later hook call must not resurrect it
+            # stop 被 set 说明这个槽是"有意卸载"过的。但线程可能早就退出了：
+            # 只看 Event 会让插件在 disable→enable 之后显示 enabled、钩子也通，
+            # 而心跳永久哑掉，任何地方都不报错。判据必须是线程还在不在。
+            old = reg.get("thread")
+            if old is not None and old.is_alive():
+                return  # unloaded on purpose, still winding down; do not resurrect
+            reg["stop"] = None
         th = reg.get("thread")
         if th is not None and th.is_alive():
             return  # hot reload: reuse the live thread, new callable already swapped in
