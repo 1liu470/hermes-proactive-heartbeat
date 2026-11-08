@@ -64,6 +64,12 @@ DEFAULTS: Dict[str, Any] = {
     "research_enabled": True,
     "research_window_hours": 72,
     "research_overdue_grace_hours": 168,
+    # 事项卫生：逾期超过这么多天仍挂着的，退出候选池（只标 stale，不删）
+    "stale_after_days": 7,
+    # 「他做掉了但没回话」的证据窗口
+    "engagement_evidence_hours": 24,
+    # 结案这么久之后搬进冷区，主表只留还在办的事
+    "archive_closed_after_days": 30,
     "research_max_items": 3,
     "research_daily_cap": 6,
     # 长期层：目标同步与每周体检
@@ -221,6 +227,63 @@ def _reason_kind(reason: Any) -> str:
     日志去重若拿整串比分，分数每轮都在动，全天每 15 分钟就会落一行相同的拒绝。
     """
     return str(reason or "").split("(", 1)[0].strip()
+
+
+def _settle_by_evidence(state: Dict[str, Any], now: float,
+                        window_hours: float = 24.0) -> str:
+    """窗口内事项已被处置，就记一次正反馈，返回信号名；无证据返回空串。
+
+    这条路补的是「他照做了但没回话」。放在 tick 里也调一次，因为只看对话的话，
+    他不打开 Hermes 的时候就永远判不出来，而那恰是多数情况。
+    """
+    rt = state.setdefault("runtime", {})
+    pending = rt.get("pending")
+    if not isinstance(pending, dict):
+        return ""
+    signal = E.infer_engagement(pending, _items(state), now, window_hours=window_hours)
+    if not signal:
+        return ""
+    state["adaptive_offset"] = E.next_adaptive_offset(
+        float(state.get("adaptive_offset") or 0.0), "engaged")
+    state["ignore_streak"] = 0
+    ptype = str(pending.get("type") or "")
+    if ptype:
+        ts = state.setdefault("type_stats", {}).setdefault(ptype, {"sent": 0, "engaged": 0})
+        ts["engaged"] = int(ts.get("engaged") or 0) + 1
+    rt["pending"] = None
+    S.log_decision({"ts": now, "event": "feedback", "reason": "engaged:" + signal,
+                    "outcome": "engaged", "item_id": pending.get("item_id"),
+                    "adaptive_offset": state["adaptive_offset"], "ignore_streak": 0})
+    return signal
+
+
+def _hygiene_pass(ctx, now: float) -> None:
+    """tick 开头的一遍账务：证据结算 + 淤积清退。
+
+    两件事都不该等用户开口。用独立短事务，避免随后几秒的联网检索与模型调用
+    期间，这份改动被别处的写入覆盖掉。
+    """
+    try:
+        with S.transaction() as st:
+            _settle_by_evidence(st, now, float(_cfg(ctx, "engagement_evidence_hours") or 24))
+            items = _items(st)
+            retired = E.retire_stale(items, now, days=float(_cfg(ctx, "stale_after_days") or 7))
+            if retired:
+                _mutate_items(st, items)
+                for it in retired:
+                    S.log_decision({"ts": now, "event": "stale", "item_id": it.id,
+                                    "title": it.title, "due": it.due})
+            # 结案久了的搬进冷区。主表只留还在办的事，账本长度才有界。
+            keep, archived = E.split_closed(items, now, days=float(
+                _cfg(ctx, "archive_closed_after_days") or 30))
+            if archived:
+                box = st.setdefault("archive", {}).setdefault("items", [])
+                box.extend(i.to_dict() for i in archived)
+                st["archive"]["items"] = box[-200:]
+                _mutate_items(st, keep)
+                S.log_decision({"ts": now, "event": "archive", "count": len(archived)})
+    except Exception:
+        log.debug("proactive: hygiene pass failed", exc_info=True)
 
 
 def _mutate_items(state: Dict[str, Any], items: List[E.Item]) -> None:
@@ -543,6 +606,9 @@ def _tick_body(ctx) -> None:
     tz = _tz()
     local_hm = datetime.fromtimestamp(now, tz).hour * 60 + datetime.fromtimestamp(now, tz).minute
 
+    # 先过一遍账：他也许早就把事办了、只是没回话；也许某件事已经烂在池子里两周。
+    _hygiene_pass(ctx, now)
+
     state = S.load()
     _roll_day(state, now)
     rt = state["runtime"]
@@ -632,14 +698,28 @@ def _tick_body(ctx) -> None:
     item = verdict.item
     assert item is not None
     related = _pick_related(items, item)
-    # 先替他把功课做了：硬期限进入窗口时查一次，查不到不阻塞
-    hits = RS.gather(
-        ctx, item, state, now,
-        window_hours=float(_cfg(ctx, "research_window_hours") or 72),
-        max_items=int(_cfg(ctx, "research_max_items") or 3),
-        daily_cap=int(_cfg(ctx, "research_daily_cap") or 6),
-        overdue_grace_hours=float(_cfg(ctx, "research_overdue_grace_hours") or 168),
-    ) if bool(_cfg(ctx, "research_enabled")) else []
+    # 先替他把功课做了：期限前后都查一次，查不到不阻塞
+    _report: Dict[str, Any] = {}
+    if bool(_cfg(ctx, "research_enabled")):
+        hits = RS.gather(
+            ctx, item, state, now,
+            window_hours=float(_cfg(ctx, "research_window_hours") or 72),
+            max_items=int(_cfg(ctx, "research_max_items") or 3),
+            daily_cap=int(_cfg(ctx, "research_daily_cap") or 6),
+            overdue_grace_hours=float(_cfg(ctx, "research_overdue_grace_hours") or 168),
+            report=_report,
+        )
+    else:
+        hits = []
+        _report = {"status": "skipped", "reason": "disabled"}
+    # 把这次检索的结论落账。静默失败最难查，所以留一行可读的记录。
+    def _note_research(st: Dict[str, Any]) -> None:
+        st["runtime"]["last_research"] = {"at": now, "item_id": item.id,
+                                          "hits": len(hits), **_report}
+    try:
+        _commit(_note_research)
+    except Exception:
+        log.debug("proactive: research note failed", exc_info=True)
     intel = RS.format_intel(hits)
     decision = _ask_model(ctx, item, verdict.components, now, related, intel)
     if not decision or not decision["send"]:
@@ -664,7 +744,17 @@ def _tick_body(ctx) -> None:
         path = RS.save_intel(item, hits, now)
         if path:
             head = RS.intel_headline(hits)
-            attachment = "资料已存本机：%s%s\n" % (path, ("（%s）" % head) if head else "")
+            # 投到手机上看不见本机路径，那句话等于没说。远程目标把要点直接写进消息，
+            # 本机目标仍给路径——他要的是能点开的那份原文。
+            target = str(rt.get("last_platform") or "").lower()
+            if target in ("", "desktop", "cli", "tui", "local"):
+                attachment = "资料已存本机：%s%s\n" % (path, ("（%s）" % head) if head else "")
+            else:
+                lines = [ln for ln in RS.format_intel(hits).splitlines()
+                         if ln.strip() and not ln.startswith("已知情报")]
+                body = "\n".join(lines[:3])
+                attachment = ("查到几条，摘在这里：\n%s\n（完整资料存本机 state/proactive-heartbeat/intel/）\n"
+                              % body) if body else ""
     content = P.INJECTION_TEMPLATE.format(
         marker=P.INJECTION_MARKER, title=item.title,
         due_human=E.humanize_due(item.due, now),
@@ -801,16 +891,26 @@ def _on_pre_llm_call(**kw: Any) -> Optional[Dict[str, str]]:
             if pending and platform in SKIP_PLATFORMS:
                 outcome = None  # an unattended run is not a human answer
             elif pending:
-                # Any human turn inside the window counts as "not ignored" — our own
-                # injection is marker-guarded above and unattended runs are filtered just
-                # above, so this only fires on a real person.  The session_key decides
-                # *delivery*, not whether the user answered.
-                outcome = E.classify_feedback(pending, now, user_replied=True,
-                                              user_text=str(text or ""))
+                # 文字回复之外先看事实：他可能在窗口内直接把事办了，只是没回「收到」。
+                # 真账本发七次、回应零次，就是只认文字造成的——门槛学不到东西。
+                if _settle_by_evidence(state, now, float(
+                        _cfg(ctx, "engagement_evidence_hours") or 24)):
+                    outcome = "engaged_by_action"
+                else:
+                    # Any human turn inside the window counts as "not ignored" — our own
+                    # injection is marker-guarded above and unattended runs are filtered just
+                    # above, so this only fires on a real person.  The session_key decides
+                    # *delivery*, not whether the user answered.
+                    outcome = E.classify_feedback(pending, now, user_replied=True,
+                                                  user_text=str(text or ""))
             else:
                 outcome = None
 
-            if outcome == "expired":
+            if outcome == "engaged_by_action":
+                # _settle_by_evidence 已经记完账（offset、type_stats、日志都在里面），
+                # 这里只吸收掉这个标记，不能重复记第二笔。
+                pass
+            elif outcome == "expired":
                 # 过了应答窗口就丢弃：不计 offset，也不记 ignore。
                 # 一条一天前的提醒，今天随口回句"好的"记成有效会一路调低门槛；
                 # 记成无视更是凭空记账。两种归因都不如作废。
@@ -1050,9 +1150,11 @@ def _handle_status(**_: Any) -> str:
         "today_sent": rt.get("daily_count"),
         "last_injection_at": rt.get("last_injection_at"),
         "last_session_key": rt.get("last_session_key"),
+        "last_research": rt.get("last_research"),
         "open_items": [{"id": i.id, "title": i.title,
                         "due": E.humanize_due(i.due, now) if i.due else None,
                         "nudges": i.nudges} for i in items],
+        "retired": len([i for i in _items(state) if i.status == "stale"]),
         "delivery": {
             "mode": mode,
             "wanted": _want_platforms(mode),
@@ -1196,6 +1298,16 @@ def _handle_command(raw: str) -> str:
                     f"{'仅私聊' if _d.get('require_direct') else '含群聊'}｜会话 {_sess}")
     for it in data["open_items"][:6]:
         lines.append(f"  · {it['title']}（{it['due'] or '无期限'}，已提醒 {it['nudges']} 次）")
+    if data.get("retired"):
+        lines.append(f"另有 {data['retired']} 条已逾期退场（stale），不再打扰，账仍可查。")
+    _lr = data.get("last_research") or {}
+    if _lr:
+        _why = {"window": "不在检索窗口", "daily_cap": "今日检索额度已满",
+                "cache": "命中缓存", "knowledge": "命中知识库",
+                "disabled": "研究层已关闭"}.get(_lr.get("reason") or "", "")
+        _when = time.strftime("%m-%d %H:%M", time.localtime(float(_lr.get("at") or 0)))
+        lines.append(f"最近检索：{_when}｜{_lr.get('status')}"
+                     f"{'（' + _why + '）' if _why else ''}｜{_lr.get('hits', 0)} 条")
     if data["recent"]:
         last = data["recent"][-1]
         lines.append(f"最近一次决策：{last.get('event')} / {last.get('reason')}")

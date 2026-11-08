@@ -194,7 +194,8 @@ class Item:
     created_at: float = 0.0
     nudges: int = 0
     last_nudged_at: Optional[float] = None
-    status: str = "open"             # open | done | dropped
+    status: str = "open"             # open | done | dropped | stale
+    closed_at: Optional[float] = None
     tags: List[str] = field(default_factory=list)
     note: str = ""
     type: str = ""                   # submit | attend | apply | reply | other
@@ -207,6 +208,7 @@ class Item:
             "id": self.id, "title": self.title, "kind": self.kind, "due": self.due,
             "weight": self.weight, "created_at": self.created_at, "nudges": self.nudges,
             "last_nudged_at": self.last_nudged_at, "status": self.status,
+            "closed_at": self.closed_at,
             "tags": list(self.tags), "note": self.note, "type": self.type,
         }
 
@@ -221,6 +223,7 @@ class Item:
             nudges=int(d.get("nudges") or 0),
             last_nudged_at=float(d["last_nudged_at"]) if d.get("last_nudged_at") else None,
             status=str(d.get("status") or "open"),
+            closed_at=float(d["closed_at"]) if d.get("closed_at") else None,
             tags=[str(t) for t in (d.get("tags") or [])],
             note=str(d.get("note") or ""), type=str(d.get("type") or ""),
         )
@@ -358,6 +361,71 @@ def item_type(item: Item) -> str:
         if re.search(pat, item.title or ""):
             return name
     return "other"
+
+
+def retire_stale(items: Sequence[Item], now: float, *,
+                 days: float = 7.0) -> List[Item]:
+    """把逾期太久仍挂着的事项摘出候选池，返回被摘的那几件。
+
+    逾期的 deadline 过了七天还 open，它不再是待办，是淤积。留在池子里有三重代价：
+    占掉候选位、把「未结 N 件」这个数字撑大、每轮陪跑一遍打分。
+    只改状态不删除——他哪天想起来问，账还在。
+    """
+    cutoff = now - max(0.0, days) * 86400.0
+    out: List[Item] = []
+    for it in items:
+        if not it.is_open() or it.kind != "deadline":
+            continue
+        if it.due is None or it.due > cutoff:
+            continue
+        it.status = "stale"
+        it.closed_at = now
+        out.append(it)
+    return out
+
+
+def infer_engagement(pending: Optional[Dict[str, Any]], items: Sequence[Item],
+                     now: float, *, window_hours: float = 24.0) -> str:
+    """文字之外的正信号：他在窗口内把这件事处置掉了。
+
+    真人很少回「收到」，他直接去办。只认文字回复，等于把「照做了但没吭声」记成
+    「无视」，门槛越学越偏——真账本里发七次、回应零次，就是这个后果。
+    返回 "done"（被标完成或放弃）、"gone"（从表里消失）或 ""（无证据）。
+    """
+    p = pending or {}
+    item_id = str(p.get("item_id") or "")
+    at = float(p.get("at") or 0.0)
+    if not item_id or not at:
+        return ""
+    if now - at > max(0.0, window_hours) * 3600.0:
+        return ""
+    for it in items:
+        if it.id != item_id:
+            continue
+        # stale 是系统自己摘的，不算他的回应，否则等于自欺。
+        return "done" if it.status in ("done", "dropped") else ""
+    # 事项不在表里，不能当成「他做完了」：归档、外部源重扫、账本损坏都会让它消失。
+    # 这种证据太软，宁可漏记一笔功劳，也不要凭空给他记账。
+    return ""
+
+
+def split_closed(items: Sequence[Item], now: float, *,
+                 days: float = 30.0) -> Tuple[List[Item], List[Item]]:
+    """把早已结案的事项分出来，返回 (留着的, 该归档的)。
+
+    结案三十天后它不再参与任何判断，留着只让 state.json 越长越慢。
+    归档不是删除：他哪天问「上个月那件事办得怎么样」，账还在。
+    """
+    cutoff = now - max(0.0, days) * 86400.0
+    keep: List[Item] = []
+    out: List[Item] = []
+    for it in items:
+        if it.is_open():
+            keep.append(it)
+            continue
+        closed = it.closed_at or it.last_nudged_at or it.created_at or 0.0
+        (out if closed and closed < cutoff else keep).append(it)
+    return keep, out
 
 
 def type_offset(type_stats: Optional[Dict[str, Any]], t: str, *,

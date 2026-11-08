@@ -177,15 +177,27 @@ def gather(ctx, item: E.Item, state: Dict[str, Any], now: float, *,
            window_hours: float = 72.0, max_items: int = 3,
            daily_cap: int = 6, cache_hours: float = 24.0,
            knowledge_days: float = 30.0,
-           overdue_grace_hours: float = 168.0) -> List[Dict[str, str]]:
-    """返回该事项的情报条目；任何一步失败都返回空列表。"""
+           overdue_grace_hours: float = 168.0,
+           report: Optional[Dict[str, Any]] = None) -> List[Dict[str, str]]:
+    """返回该事项的情报条目；任何一步失败都返回空列表。
+
+    ``report`` 会回填这次为什么有、为什么没有——「一次都没查过」这种故障
+    只能靠读账本发现，太隐蔽了。
+    """
+    def _note(status: str, reason: str = "") -> None:
+        if report is not None:
+            report.update({"status": status, "reason": reason})
+
     if not should_research(item, now, window_hours, overdue_grace_hours):
+        _note("skipped", "window")
         return []
 
     research = state.setdefault("research", {})
     cached = research.get(item.id)
     if cached and now - float(cached.get("at") or 0) < cache_hours * 3600:
-        return list(cached.get("hits") or [])
+        cached_hits = list(cached.get("hits") or [])
+        _note("cached" if cached_hits else "empty", "cache")
+        return cached_hits
 
     # 知识库：同一主题查过就复用，不必重搜。这件事跨月，缓存不该只有一天。
     knowledge = state.setdefault("knowledge", {})
@@ -198,6 +210,7 @@ def gather(ctx, item: E.Item, state: Dict[str, Any], now: float, *,
             if hits:
                 research[item.id] = {"at": now, "query": entry.get("query"), "hits": hits,
                                      "from": "knowledge"}
+                _note("cached", "knowledge")
                 return hits
 
     # 与 engine.local_day_key 同一口径：系统本地 = Asia/Shanghai（+08:00），
@@ -205,6 +218,7 @@ def gather(ctx, item: E.Item, state: Dict[str, Any], now: float, *,
     day = time.strftime("%Y-%m-%d")
     used = int((state.setdefault("research_calls", {}) or {}).get(day) or 0)
     if used >= daily_cap:
+        _note("skipped", "daily_cap")
         return []
 
     query = build_query(item)
@@ -227,6 +241,7 @@ def gather(ctx, item: E.Item, state: Dict[str, Any], now: float, *,
     if len(research) > 100:
         keep = sorted(research.items(), key=lambda kv: float(kv[1].get("at") or 0))[-60:]
         state["research"] = dict(keep)
+    _note("ok" if hits else "empty")
     return hits
 
 
