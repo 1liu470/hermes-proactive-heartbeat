@@ -63,6 +63,7 @@ DEFAULTS: Dict[str, Any] = {
     # 主动研究：进入期限窗口时先替他查一次资料，再决定怎么说
     "research_enabled": True,
     "research_window_hours": 72,
+    "research_overdue_grace_hours": 168,
     "research_max_items": 3,
     "research_daily_cap": 6,
     # 长期层：目标同步与每周体检
@@ -637,6 +638,7 @@ def _tick_body(ctx) -> None:
         window_hours=float(_cfg(ctx, "research_window_hours") or 72),
         max_items=int(_cfg(ctx, "research_max_items") or 3),
         daily_cap=int(_cfg(ctx, "research_daily_cap") or 6),
+        overdue_grace_hours=float(_cfg(ctx, "research_overdue_grace_hours") or 168),
     ) if bool(_cfg(ctx, "research_enabled")) else []
     intel = RS.format_intel(hits)
     decision = _ask_model(ctx, item, verdict.components, now, related, intel)

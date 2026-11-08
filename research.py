@@ -35,13 +35,17 @@ def _query_from_note(item: E.Item) -> str:
     return ""
 
 
-def should_research(item: E.Item, now: float, window_hours: float) -> bool:
+def should_research(item: E.Item, now: float, window_hours: float,
+                    overdue_grace_hours: float = 168.0) -> bool:
     if item.kind == "sense":
         return bool(_query_from_note(item))
     if item.kind != "deadline" or item.due is None:
         return False
     hours = (item.due - now) / 3600.0
-    return 0 <= hours <= window_hours
+    # 逾期不等于没救。刚过期那几天，「找谁、还能不能补、要什么材料」恰恰最需要查；
+    # 原来的下界是 0，等于他一开始就错过的事，功课立刻停止，提醒反而更空。
+    # 逾过一周就是陈旧账，再查只是噪音，所以给一个有界的落后窗口。
+    return -max(0.0, overdue_grace_hours) <= hours <= window_hours
 
 
 def build_query(item: E.Item) -> str:
@@ -172,9 +176,10 @@ def _similar(a: str, b: str) -> float:
 def gather(ctx, item: E.Item, state: Dict[str, Any], now: float, *,
            window_hours: float = 72.0, max_items: int = 3,
            daily_cap: int = 6, cache_hours: float = 24.0,
-           knowledge_days: float = 30.0) -> List[Dict[str, str]]:
+           knowledge_days: float = 30.0,
+           overdue_grace_hours: float = 168.0) -> List[Dict[str, str]]:
     """返回该事项的情报条目；任何一步失败都返回空列表。"""
-    if not should_research(item, now, window_hours):
+    if not should_research(item, now, window_hours, overdue_grace_hours):
         return []
 
     research = state.setdefault("research", {})
